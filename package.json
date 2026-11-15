@@ -1,0 +1,42 @@
+{
+  "name": "@krtuworks/sdk",
+  "version": "1.0.0",
+  "description": "Krtuworks SDK for web games and apps: Krtuworks ID sign-in, guests, sessions, events, progress, cloud files and remote config.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "AGENTS.md", "CHANGELOG.md", "LICENSE", "NOTICE"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test 'test/**/*.test.ts'"
+  },
+  "author": "Krtuworks LLC",
+  "license": "Apache-2.0",
+  "homepage": "https://partner.krtuworks.com/docs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/krtuworks/krtuworks-sdk-js.git"
+  },
+  "bugs": {
+    "email": "support@krtuworks.com"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.4",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}

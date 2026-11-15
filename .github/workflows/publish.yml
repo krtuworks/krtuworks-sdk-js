@@ -1,0 +1,40 @@
+# Publishes @krtuworks/sdk to npm when a version tag is pushed, through npm trusted publishing
+# (OIDC: npm trusts this workflow of this repository, no token is stored anywhere).
+# A version already on npm (the first one was published by hand) is skipped, not failed.
+name: Publish to npm
+
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: The tag is the package version
+        run: test "$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - name: Already on npm?
+        id: published
+        run: |
+          if npm view "@krtuworks/sdk@$GITHUB_REF_NAME" version >/dev/null 2>&1; then echo "yes=1" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.published.outputs.yes != '1'
+        run: npm install --global npm@11.16.0
+      - if: steps.published.outputs.yes != '1'
+        run: npm ci
+      - if: steps.published.outputs.yes != '1'
+        run: npx tsc --noEmit
+      - if: steps.published.outputs.yes != '1'
+        run: npm test
+      - if: steps.published.outputs.yes != '1'
+        run: npm run build
+      - if: steps.published.outputs.yes != '1'
+        run: npm publish --provenance --access public
