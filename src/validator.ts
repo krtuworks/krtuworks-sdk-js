@@ -228,7 +228,8 @@ export async function validate(options: ValidateOptions): Promise<ValidationRepo
         const wait = isKrtuworksError(err, 'too_many_writes') ? (err.retryAfter ?? WRITE_LIMIT_S) : Infinity;
         if (wait > WRITE_WAIT_S) throw err;
         await new Promise((r) => setTimeout(r, wait * 1000 + 250));
-        const resent = (await k.files.resume()).filter((u) => u.slot === slot.key);
+        // An older save of this slot left by another run is replaced by this one; only this one's outcome counts.
+        const resent = (await k.files.resume()).filter((u) => u.slot === slot.key && u.outcome !== 'replaced');
         const refused = resent.find((u) => u.outcome !== 'saved');
         if (refused || !resent.length) return check('cloud_save', 'FAILED', refused?.code ?? 'not sent');
       }

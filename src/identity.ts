@@ -168,13 +168,22 @@ export class Identity {
    * One refresh at a time in this tab (single flight) and across tabs (the lock).
    */
   async accessToken(force = false): Promise<string> {
+    return (await this.credentials(force)).accessToken;
+  }
+
+  /**
+   * The access token together with the player it belongs to, read from the same stored tokens: a refresh
+   * may hand back another player's tokens (another tab signed in meanwhile), and only the pair says whose.
+   */
+  async credentials(force = false): Promise<{ accessToken: string; subject: string }> {
     const t = this.tokens;
     if (!t) throw signedOut();
-    if (!force && t.accessExpiresAt - REFRESH_EARLY_MS > this.ctx.clock.serverNow()) return t.accessToken;
+    if (!force && t.accessExpiresAt - REFRESH_EARLY_MS > this.ctx.clock.serverNow()) return { accessToken: t.accessToken, subject: t.subject };
     this.refreshing ??= this.refresh(t.accessToken).finally(() => {
       this.refreshing = null;
     });
-    return (await this.refreshing).accessToken;
+    const next = await this.refreshing;
+    return { accessToken: next.accessToken, subject: next.subject };
   }
 
   private async token(fields: Record<string, string | undefined>): Promise<Answer> {

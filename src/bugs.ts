@@ -240,7 +240,7 @@ export class BugReports {
       if ((this.waitUntil.get(w.reportId) ?? 0) > now) continue;
       try {
         if (!w.bugId) {
-          const answer = await this.api.player('/v1/me/bug-reports', { method: 'POST', json: w.body });
+          const answer = await this.api.player('/v1/me/bug-reports', { method: 'POST', json: w.body, owner: subject });
           const bugId = (answer.json?.report as { id?: unknown } | undefined)?.id;
           if (typeof bugId !== 'string') throw new KrtuworksError('invalid_answer', 'The server answered without the report.');
           w.bugId = bugId;
@@ -252,6 +252,7 @@ export class BugReports {
               method: 'PUT',
               body: w.screenshot.bytes as BodyInit,
               headers: { 'content-type': w.screenshot.type },
+              owner: subject,
             });
           } catch (err) {
             // The report is in: a screenshot it already has is done, one refused for good is let go.

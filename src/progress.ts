@@ -249,35 +249,56 @@ export class ProgressQueue {
 
   /**
    * Moves `from`'s waiting progress to `to` (the first player after anon play, or a merge target).
-   * Frozen ops keep their ids: one the server already applied under the old account answers
-   * `duplicate` under the new one (the merge moved its receipt), so nothing counts twice.
+   * Everything that waits for `from` is first frozen into ops with ids and written back; only then do the
+   * ops move, and an op the target already holds is not added again. The target and the source are two
+   * writes: a move cut short between them (the app closed, the delete failed) and run again brings the
+   * same ids, so nothing is added twice. One the server already applied under the old account answers
+   * `duplicate` under the new one (the merge moved its receipt).
    */
   async move(from: string, to: string): Promise<void> {
+    if (from === to) return;
     await this.loadKinds();
     const [first, second] = from < to ? [from, to] : [to, from];
     await withLock(this.key(first), () =>
       withLock(this.key(second), async () => {
         const source = await this.load(from);
+        if (this.freezeAll(source)) await this.save(from, source);
         const target = await this.load(to);
-        for (const [key, s] of Object.entries(source.stats)) {
-          const t = (target.stats[key] ??= { inFlight: [], pending: [] });
-          t.inFlight.push(...s.inFlight);
-          t.pending = foldContributions([...s.pending, ...t.pending], this.kinds[key]);
-        }
+        const add = (into: { inFlight: FrozenOp[] }, ops: FrozenOp[]): void => {
+          into.inFlight.push(...ops.filter((op) => !into.inFlight.some((held) => held.opId === op.opId)));
+        };
+        for (const [key, s] of Object.entries(source.stats)) add((target.stats[key] ??= { inFlight: [], pending: [] }), s.inFlight);
         for (const [key, u] of Object.entries(source.unlocks)) {
           const t = (target.unlocks[key] ??= { inFlight: [], pending: false });
-          t.inFlight.push(...u.inFlight);
-          t.pending = t.pending || (u.pending && !t.inFlight.length);
+          add(t, u.inFlight);
+          if (t.inFlight.length) t.pending = false;
         }
-        for (const [key, b] of Object.entries(source.scores)) {
-          const t = (target.scores[key] ??= { inFlight: [], pending: [] });
-          t.inFlight.push(...b.inFlight);
-          t.pending = foldScores([...b.pending, ...t.pending], this.boards[key]);
-        }
+        for (const [key, b] of Object.entries(source.scores)) add((target.scores[key] ??= { inFlight: [], pending: [] }), b.inFlight);
         await this.save(to, target);
         await this.ctx.store.delete(this.key(from));
       }),
     );
+  }
+
+  /** Freezes everything that waits in `state` into ops with ids (a move's first step); whether anything was. */
+  private freezeAll(state: ProgressState): boolean {
+    let frozen = false;
+    for (const [key, s] of Object.entries(state.stats)) {
+      for (const c of foldContributions(s.pending, this.kinds[key])) s.inFlight.push({ opId: uuidV7(), type: 'stat', key, value: c.value });
+      frozen ||= s.pending.length > 0;
+      s.pending = [];
+    }
+    for (const [key, u] of Object.entries(state.unlocks)) {
+      if (u.pending && !u.inFlight.length) u.inFlight.push({ opId: uuidV7(), type: 'unlock', key });
+      frozen ||= u.pending;
+      u.pending = false;
+    }
+    for (const [key, b] of Object.entries(state.scores)) {
+      for (const c of foldScores(b.pending, this.boards[key])) b.inFlight.push({ opId: uuidV7(), type: 'score', key, value: c.value, ...(c.details ? { details: c.details } : {}) });
+      frozen ||= b.pending.length > 0;
+      b.pending = [];
+    }
+    return frozen;
   }
 
   /** Freezes the next op of every stat and achievement with none in flight; returns every op to send. */
@@ -334,6 +355,7 @@ export class ProgressQueue {
         answer = await this.ctx.api.player('/v1/me/progress', {
           method: 'POST',
           json: { platform: this.ctx.opts.platform, build: this.ctx.opts.build, ops },
+          owner,
         });
       } catch (err) {
         if (!isKrtuworksError(err)) throw err;

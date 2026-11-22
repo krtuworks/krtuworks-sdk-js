@@ -2,6 +2,7 @@ import type { Api } from './api.js';
 import type { ResolvedOptions } from './config.js';
 import { KrtuworksError, isKrtuworksError } from './errors.js';
 import { sha256Hex, uuidV4 } from './ids.js';
+import { withLock } from './locks.js';
 import type { KrtuStore } from './store.js';
 
 export interface FileVersion {
@@ -50,7 +51,19 @@ interface PendingUpload {
   bytes: Uint8Array;
   deviceInfo: Record<string, string | number> | null;
   savedAt: number;
+  /** Order of saves made in the same millisecond on this device. */
+  seq?: number;
+  /** 2: when it was last sent is in its own key (none = never sent). An older record was sent when it was made. */
+  v?: 2;
 }
+
+export type ResumeOutcome = 'saved' | 'refused' | 'waiting' | 'replaced';
+
+/**
+ * How long after its last send an upload the server does not know can still arrive (an edge holds a
+ * whole request before it reaches the server). Past it, a save no one heard of is gone.
+ */
+const ARRIVAL_WINDOW_MS = 15 * 60_000;
 
 export interface SaveOptions {
   /** The version this one replaces (its id, the ETag of a read), or null for an empty slot. SETTINGS-like slots need neither. */
@@ -62,6 +75,8 @@ export interface SaveOptions {
 
 const POLL_LIMIT_MS = 60_000;
 
+const replaced = (): KrtuworksError => new KrtuworksError('save_replaced', 'A newer save of this slot took the place of this one before it was sent.', 409);
+
 /**
  * The player's files in the app's slots: a save is
  * written to the store first, sent with its upload id as the Idempotency-Key and asked about until it
@@ -70,6 +85,8 @@ const POLL_LIMIT_MS = 60_000;
 export class Files {
   /** Per slot (and device), bumped by every save started here: a read compares it before and after. */
   private readonly revisions = new Map<string, number>();
+  /** Orders the saves started in one millisecond. */
+  private seq = 0;
 
   constructor(
     private readonly opts: ResolvedOptions,
@@ -94,8 +111,49 @@ export class Files {
     return `krtu:${this.opts.clientId}:upload:${uploadId}`;
   }
 
+  private sentKey(uploadId: string): string {
+    return `krtu:${this.opts.clientId}:uploadSent:${uploadId}`;
+  }
+
+  /** One lane per player, slot and device: its saves go one at a time, oldest first. */
+  private laneLock(upload: PendingUpload): string {
+    return `krtu:${this.opts.clientId}:uploadLane:${JSON.stringify([upload.owner, upload.slot, upload.device ?? null])}`;
+  }
+
+  private async forget(uploadId: string): Promise<void> {
+    await this.store.delete(this.uploadKey(uploadId));
+    await this.store.delete(this.sentKey(uploadId));
+  }
+
+  /** When the upload was last sent; null when it never was. */
+  private async sentAt(upload: PendingUpload): Promise<number | null> {
+    const at = await this.store.get<number>(this.sentKey(upload.uploadId));
+    if (typeof at === 'number') return at;
+    return upload.v === 2 ? null : upload.savedAt;
+  }
+
+  private static before(a: PendingUpload, b: PendingUpload): boolean {
+    if (a.savedAt !== b.savedAt) return a.savedAt < b.savedAt;
+    if ((a.seq ?? 0) !== (b.seq ?? 0)) return (a.seq ?? 0) < (b.seq ?? 0);
+    return a.uploadId < b.uploadId;
+  }
+
+  /** The store's uploads of `upload`'s lane, oldest first. */
+  private async lane(upload: PendingUpload): Promise<PendingUpload[]> {
+    const out: PendingUpload[] = [];
+    for (const key of await this.store.keys(`krtu:${this.opts.clientId}:upload:`)) {
+      const u = await this.store.get<PendingUpload>(key);
+      if (u && u.owner === upload.owner && u.slot === upload.slot && (u.device ?? null) === (upload.device ?? null)) out.push(u);
+    }
+    return out.sort((a, b) => (Files.before(a, b) ? -1 : Files.before(b, a) ? 1 : 0));
+  }
+
   async list(): Promise<{ slots: SlotView[]; limits: Record<string, number> }> {
-    const answer = await this.api.player(this.path());
+    return this.listFor(undefined);
+  }
+
+  private async listFor(owner: string | undefined): Promise<{ slots: SlotView[]; limits: Record<string, number> }> {
+    const answer = await this.api.player(this.path(), { owner });
     return answer.json as unknown as { slots: SlotView[]; limits: Record<string, number> };
   }
 
@@ -129,7 +187,8 @@ export class Files {
 
   /**
    * Saves a new version of `slot`. Resolves with the new version once the server activated it; rejects
-   * with `file_conflict` (`details.current`: the version now in the slot) when another one came first.
+   * with `file_conflict` (`details.current`: the version now in the slot) when another one came first,
+   * and with `save_replaced` when a newer save of the slot took its place before it was sent.
    */
   async save(slot: string, data: Uint8Array, options: SaveOptions = {}): Promise<FileVersion> {
     const owner = this.subject();
@@ -147,9 +206,93 @@ export class Files {
       bytes: data,
       deviceInfo: options.deviceInfo ?? null,
       savedAt: Date.now(),
+      seq: (this.seq += 1),
+      v: 2,
     };
     await this.store.set(this.uploadKey(upload.uploadId), upload);
-    return this.send(upload);
+    return this.pump(upload, () => undefined);
+  }
+
+  /**
+   * Sends `target` in its lane's order. An earlier save of the lane that was never sent is replaced by the
+   * newer one; an earlier save that was sent is settled first (asked how it ended, or sent again with its
+   * id), so an older copy never lands after a newer one. `target` itself is replaced when a newer save of
+   * the lane waits behind it, unsent. `tell` hears what became of the earlier ones.
+   */
+  private async pump(target: PendingUpload, tell: (upload: PendingUpload, outcome: ResumeOutcome, code?: string) => void): Promise<FileVersion> {
+    return withLock(this.laneLock(target), async () => {
+      const lane = await this.lane(target);
+      const at = lane.findIndex((u) => u.uploadId === target.uploadId);
+      if (at < 0) return this.settledElsewhere(target);
+      // The earlier ones never sent go first: this save replaces them whatever became of the others.
+      const sentEarlier: PendingUpload[] = [];
+      for (const earlier of lane.slice(0, at)) {
+        if ((await this.sentAt(earlier)) !== null) sentEarlier.push(earlier);
+        else {
+          await this.forget(earlier.uploadId);
+          tell(earlier, 'replaced');
+        }
+      }
+      for (const earlier of sentEarlier) {
+        const ended = await this.settleEarlier(earlier);
+        tell(earlier, ended.outcome, ended.code);
+      }
+      if (at < lane.length - 1 && (await this.sentAt(target)) === null) {
+        await this.forget(target.uploadId);
+        throw replaced();
+      }
+      return this.send(target);
+    });
+  }
+
+  /**
+   * An earlier save of a lane that was sent and whose outcome is not known here: how it ended, before
+   * anything newer goes. Throws when it has not ended yet (or the server cannot be asked): the lane waits.
+   */
+  private async settleEarlier(upload: PendingUpload): Promise<{ outcome: ResumeOutcome; code?: string }> {
+    let state: Record<string, unknown> | null;
+    try {
+      state = (await this.api.player(`${this.path(upload.slot)}/uploads/${upload.uploadId}`, { owner: upload.owner })).json;
+    } catch (err) {
+      if (!isKrtuworksError(err, 'upload_not_found')) throw err;
+      // The server never had it. A save with a version check is replaced at once: should it still arrive,
+      // the newer save holds the slot and the check refuses it. One without a check could land over the
+      // newer save, so it is replaced only once it can no longer arrive.
+      if (upload.conditional || Date.now() - ((await this.sentAt(upload)) ?? 0) >= ARRIVAL_WINDOW_MS) {
+        await this.forget(upload.uploadId);
+        return { outcome: 'replaced' };
+      }
+      // It may still be on its way: sent again with its id, the server takes both as one upload.
+      try {
+        await this.send(upload);
+        return { outcome: 'saved' };
+      } catch (sent) {
+        if (isKrtuworksError(sent) && !sent.retryable && sent.code !== 'upload_pending') return { outcome: 'refused', code: sent.code };
+        throw sent;
+      }
+    }
+    if (state?.status === 'ACTIVATED') {
+      await this.forget(upload.uploadId);
+      this.onSaved();
+      return { outcome: 'saved' };
+    }
+    if (state?.status === 'REJECTED') {
+      await this.forget(upload.uploadId);
+      return { outcome: 'refused', code: String(state.code ?? 'write_failed') };
+    }
+    throw new KrtuworksError('upload_pending', 'An earlier save of this slot is still being written; this one goes after it.', 202, null, { uploadId: upload.uploadId });
+  }
+
+  /** The save's record is gone: another tab or a resume finished or replaced it; the server says how it ended. */
+  private async settledElsewhere(upload: PendingUpload): Promise<FileVersion> {
+    let state: Record<string, unknown> | null;
+    try {
+      state = (await this.api.player(`${this.path(upload.slot)}/uploads/${upload.uploadId}`, { owner: upload.owner })).json;
+    } catch (err) {
+      if (isKrtuworksError(err, 'upload_not_found')) throw replaced();
+      throw err;
+    }
+    return this.settle(upload, state);
   }
 
   private async send(upload: PendingUpload): Promise<FileVersion> {
@@ -158,6 +301,7 @@ export class Files {
       if (upload.base) headers['if-match'] = upload.base;
       else headers['if-none-match'] = '*';
     }
+    await this.store.set(this.sentKey(upload.uploadId), Date.now());
     let answer;
     try {
       answer = await this.api.player(this.path(upload.slot), {
@@ -166,9 +310,10 @@ export class Files {
         headers,
         body: upload.bytes as BodyInit,
         accept: [202],
+        owner: upload.owner,
       });
     } catch (err) {
-      if (isKrtuworksError(err) && !err.retryable) await this.store.delete(this.uploadKey(upload.uploadId));
+      if (isKrtuworksError(err) && !err.retryable) await this.forget(upload.uploadId);
       throw err;
     }
     if (answer.status === 201) return this.done(upload, (answer.json?.file as FileVersion) ?? null);
@@ -185,7 +330,7 @@ export class Files {
       const status = current?.status;
       if (status === 'ACTIVATED') return this.done(upload, null, current?.file as { id: string } | null);
       if (status === 'REJECTED') {
-        await this.store.delete(this.uploadKey(upload.uploadId));
+        await this.forget(upload.uploadId);
         throw new KrtuworksError(String(current?.code ?? 'write_failed'), 'The save was refused.', 409, null, { upload: current });
       }
       if (Date.now() - started > POLL_LIMIT_MS) {
@@ -195,17 +340,17 @@ export class Files {
       wait = Math.min(8000, wait * 2);
       // Another player now: this upload is asked about with its own player's token on a later sign-in.
       if (this.generation() !== generation) throw new KrtuworksError('context_changed', 'The player changed while the save was being written; it is finished when that player signs in again.');
-      const answer = await this.api.player(`${this.path(upload.slot)}/uploads/${upload.uploadId}`);
+      const answer = await this.api.player(`${this.path(upload.slot)}/uploads/${upload.uploadId}`, { owner: upload.owner });
       current = answer.json;
     }
   }
 
   private async done(upload: PendingUpload, file: FileVersion | null, ref?: { id: string } | null): Promise<FileVersion> {
-    await this.store.delete(this.uploadKey(upload.uploadId));
+    await this.forget(upload.uploadId);
     this.onSaved();
     if (file) return file;
     // An answer replayed from the upload's record names the version; read the slot for the whole of it.
-    const list = await this.list();
+    const list = await this.listFor(upload.owner);
     const slot = list.slots.find((s) => s.key === upload.slot);
     const versions = [slot?.file, ...(slot?.devices ?? [])].filter((v): v is FileVersion => !!v);
     const found = versions.find((v) => v.id === ref?.id) ?? versions[0];
@@ -213,21 +358,37 @@ export class Files {
     return found;
   }
 
-  /** Saves left unfinished by an earlier launch (an answer lost, a 202): finishes the signed-in player's. */
-  async resume(): Promise<Array<{ uploadId: string; slot: string; outcome: 'saved' | 'refused' | 'waiting'; code?: string }>> {
+  /**
+   * Saves left unfinished by an earlier launch (an answer lost, a 202, made offline): finishes the
+   * signed-in player's, the newest of each slot (and device) last; an older one never sent is replaced.
+   */
+  async resume(): Promise<Array<{ uploadId: string; slot: string; outcome: ResumeOutcome; code?: string }>> {
     const owner = this.subject();
-    const out: Array<{ uploadId: string; slot: string; outcome: 'saved' | 'refused' | 'waiting'; code?: string }> = [];
+    const out: Array<{ uploadId: string; slot: string; outcome: ResumeOutcome; code?: string }> = [];
     if (!owner) return out;
-    for (const key of await this.store.keys(`krtu:${this.opts.clientId}:upload:`)) {
-      const upload = await this.store.get<PendingUpload>(key);
+    const uploads = `krtu:${this.opts.clientId}:upload:`;
+    const sent = `krtu:${this.opts.clientId}:uploadSent:`;
+    const ids = new Set((await this.store.keys(uploads)).map((k) => k.slice(uploads.length)));
+    for (const key of await this.store.keys(sent)) if (!ids.has(key.slice(sent.length))) await this.store.delete(key);
+    const newest = new Map<string, PendingUpload>();
+    for (const id of ids) {
+      const upload = await this.store.get<PendingUpload>(this.uploadKey(id));
       if (!upload || upload.owner !== owner) continue;
+      const lane = this.laneLock(upload);
+      const held = newest.get(lane);
+      if (!held || Files.before(held, upload)) newest.set(lane, upload);
+    }
+    const tell = (u: PendingUpload, outcome: ResumeOutcome, code?: string): void => {
+      out.push({ uploadId: u.uploadId, slot: u.slot, outcome, ...(code ? { code } : {}) });
+    };
+    for (const upload of newest.values()) {
       try {
         // Sent again with the same id and bytes: the server answers what the first one did.
-        await this.send(upload);
-        out.push({ uploadId: upload.uploadId, slot: upload.slot, outcome: 'saved' });
+        await this.pump(upload, tell);
+        tell(upload, 'saved');
       } catch (err) {
         const code = isKrtuworksError(err) ? err.code : 'error';
-        out.push({ uploadId: upload.uploadId, slot: upload.slot, outcome: code === 'upload_pending' || (isKrtuworksError(err) && err.retryable) ? 'waiting' : 'refused', code });
+        tell(upload, code === 'save_replaced' ? 'replaced' : code === 'upload_pending' || (isKrtuworksError(err) && err.retryable) ? 'waiting' : 'refused', code);
       }
     }
     return out;
@@ -251,13 +412,13 @@ export class Files {
     const waiting = await this.store.get<PendingUpload>(this.uploadKey(uploadId));
     if (!waiting) throw new KrtuworksError('upload_not_found', 'No such waiting save on this device.', 404);
     const saved = await this.save(waiting.slot, waiting.bytes, { base, device: waiting.device ?? undefined, deviceInfo: waiting.deviceInfo ?? undefined });
-    await this.store.delete(this.uploadKey(uploadId));
+    await this.forget(uploadId);
     return saved;
   }
 
   /** A waiting save the player chose not to keep. */
   async discardWaiting(uploadId: string): Promise<void> {
-    await this.store.delete(this.uploadKey(uploadId));
+    await this.forget(uploadId);
   }
 
   /** After a merge: keep `keep` (the slot's version or the merged one) over `current` (the one the player saw). */

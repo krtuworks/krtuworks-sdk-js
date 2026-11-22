@@ -40,6 +40,14 @@ export class FakeServer {
     return this;
   }
 
+  /** A route for every path under `prefix` (ids the test cannot know in advance); exact routes win. */
+  onPrefix(method: string, prefix: string, handler: Handler): this {
+    this.prefixes.push({ method, prefix, handler });
+    return this;
+  }
+
+  private readonly prefixes: Array<{ method: string; prefix: string; handler: Handler }> = [];
+
   count(method: string, path: string): number {
     return this.calls.filter((c) => c.method === method && c.path === path).length;
   }
@@ -68,7 +76,7 @@ export class FakeServer {
     };
     this.calls.push(call);
     if (this.offline.has(url.pathname)) throw new TypeError('fetch failed');
-    const handler = this.routes.get(`${method} ${url.pathname}`);
+    const handler = this.routes.get(`${method} ${url.pathname}`) ?? this.prefixes.find((r) => r.method === method && url.pathname.startsWith(r.prefix))?.handler;
     const reply = handler ? await handler(call) : { status: 404, json: { error: { code: 'not_found', message: url.pathname } } };
     const h = new Headers({ date: new Date().toUTCString(), ...reply.headers });
     if (reply.json !== undefined) {

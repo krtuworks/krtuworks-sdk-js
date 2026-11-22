@@ -75,6 +75,7 @@ export class SessionKeeper {
         ...(device ? { device } : {}),
         ...(this.opts.locale ? { locale: this.opts.locale } : {}),
       },
+      owner,
     });
     const session = answer.json?.session as { id: string; startedAt: string } | undefined;
     if (!session || this.subject() !== owner) return null;
@@ -98,6 +99,7 @@ export class SessionKeeper {
       const answer = await this.api.player(`/v1/sessions/${session.id}/heartbeat`, {
         method: 'POST',
         json: { activeSeconds: this.activeSeconds(), foreground: this.activeSince !== null },
+        owner: session.owner,
       });
       const next = answer.json?.nextHeartbeatSeconds;
       if (typeof next === 'number' && next > 0) this.heartbeatSeconds = next;
@@ -123,13 +125,14 @@ export class SessionKeeper {
       await this.api.player(`/v1/sessions/${session.id}/heartbeat`, {
         method: 'POST',
         json: { activeSeconds: this.activeSeconds(), foreground: this.activeSince !== null },
+        owner: session.owner,
       });
     } catch (err) {
       failure = err;
     }
     this.close();
     // The session is ended even when its heartbeat failed, so the round leaves nothing open.
-    const ended = this.api.player(`/v1/sessions/${session.id}/end`, { method: 'POST', json: { activeSeconds: this.activeSeconds() } });
+    const ended = this.api.player(`/v1/sessions/${session.id}/end`, { method: 'POST', json: { activeSeconds: this.activeSeconds() }, owner: session.owner });
     if (failure) {
       await ended.catch(() => undefined);
       throw failure;
@@ -143,7 +146,7 @@ export class SessionKeeper {
     this.close();
     if (!session) return;
     await this.api
-      .player(`/v1/sessions/${session.id}/end`, { method: 'POST', json: { activeSeconds: this.activeSeconds() }, keepalive: true })
+      .player(`/v1/sessions/${session.id}/end`, { method: 'POST', json: { activeSeconds: this.activeSeconds() }, keepalive: true, owner: session.owner })
       .catch(() => undefined);
   }
 

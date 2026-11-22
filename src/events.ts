@@ -177,19 +177,29 @@ export class EventQueue {
    * took under the old account answers the same under the new one).
    */
   async move(from: string, to: string): Promise<void> {
+    if (from === to) return;
     await this.persist();
     const [first, second] = from < to ? [from, to] : [to, from];
     await withLock(this.lock(first), () =>
       withLock(this.lock(second), async () => {
         const source = await this.load(from);
         if (!source.pending.length && !source.batch && source.dropped === source.reported) return;
+        // The dropped count leaves the source before it reaches the target: a move cut short between
+        // the writes loses it rather than says it twice.
+        const unsaid = source.dropped - source.reported;
+        if (unsaid > 0) {
+          source.reported = source.dropped;
+          await this.save(from, source);
+        }
         const target = await this.load(to);
-        if (source.batch) {
-          if (target.batch) target.pending.unshift(...source.batch.events);
+        // A move run again after it was cut short brings events the target holds already: they go once.
+        const held = new Set([...target.pending, ...(target.batch?.events ?? [])].map((e) => e.id));
+        if (source.batch && source.batch.batchId !== target.batch?.batchId) {
+          if (target.batch) target.pending.unshift(...source.batch.events.filter((e) => !held.has(e.id)));
           else target.batch = source.batch;
         }
-        target.pending.push(...source.pending);
-        target.dropped += source.dropped - source.reported;
+        target.pending.push(...source.pending.filter((e) => !held.has(e.id)));
+        target.dropped += Math.max(0, unsaid);
         this.trim(target);
         await this.save(to, target);
         await this.ctx.store.delete(this.key(from));
@@ -288,6 +298,7 @@ export class EventQueue {
         method: 'POST',
         body: body as BodyInit,
         headers: { 'content-type': 'application/json', ...(zipped ? { 'content-encoding': 'gzip' } : {}) },
+        owner,
       });
     } catch (err) {
       return this.failed(owner, batch, err);
