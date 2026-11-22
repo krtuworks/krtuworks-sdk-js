@@ -18,7 +18,17 @@ export interface SendInit {
   bytes?: boolean;
   /** Let the request outlive the page (the end of a session on pagehide). */
   keepalive?: boolean;
+  /** How long the whole call may take, answer body included (default `REQUEST_TIMEOUT_MS`). */
+  timeoutMs?: number;
 }
+
+/**
+ * The longest a call may take, from sending to the last byte of the answer (the Unity and Unreal
+ * packages use the same). A connection that stays open without finishing its answer would otherwise
+ * hold every queue sent after it, and a sign-out that waits for them. Every call is safe to repeat
+ * (operation, batch and upload ids), so one cut short is simply sent again later.
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
 
 function retryAfterOf(headers: Headers, json: Record<string, unknown> | null): number | null {
   const fromBody = json?.retryAfter;
@@ -52,26 +62,60 @@ export function errorOf(answer: Answer): KrtuworksError {
   return new KrtuworksError(code, message, answer.status, retryAfterOf(answer.headers, answer.json), rest);
 }
 
+/**
+ * Reads `promise` unless the call's time runs out first. The abort alone does not do: a fetch given its
+ * own transport (a test's, a wrapper's) may ignore the signal, and the call must end all the same.
+ */
+function bounded<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const stop = (): void => reject(signal.reason);
+    signal.addEventListener('abort', stop, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', stop);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', stop);
+        reject(err);
+      },
+    );
+  });
+}
+
 export async function send(fetchFn: typeof fetch, clock: Clock, url: string, init: SendInit): Promise<Answer> {
-  let res: Response;
+  const host = new URL(url).host;
+  const limit = init.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`no complete answer within ${Math.round(limit / 1000)} s`)), limit);
+  (timer as { unref?: () => void }).unref?.();
   try {
-    res = await fetchFn(url, { method: init.method, headers: init.headers, body: init.body ?? undefined, keepalive: init.keepalive });
-  } catch (err) {
-    throw new KrtuworksError('network_error', `No answer from ${new URL(url).host}: ${(err as Error)?.message ?? String(err)}`);
+    let res: Response;
+    try {
+      res = await bounded(
+        fetchFn(url, { method: init.method, headers: init.headers, body: init.body ?? undefined, keepalive: init.keepalive, signal: controller.signal }),
+        controller.signal,
+      );
+    } catch (err) {
+      throw new KrtuworksError('network_error', `No answer from ${host}: ${(err as Error)?.message ?? String(err)}`);
+    }
+    clock.noteServerTime(res.headers.get('date'));
+    let json: Record<string, unknown> | null = null;
+    let bytes: Uint8Array | null = null;
+    const type = res.headers.get('content-type') ?? '';
+    try {
+      if (init.bytes && res.ok) bytes = new Uint8Array(await bounded(res.arrayBuffer(), controller.signal));
+      else if (type.includes('json')) json = (await bounded(res.json(), controller.signal)) as Record<string, unknown>;
+      else await bounded(res.arrayBuffer(), controller.signal);
+    } catch (err) {
+      throw new KrtuworksError('network_error', `The answer from ${host} was cut: ${(err as Error)?.message ?? String(err)}`, res.status);
+    }
+    if (json && typeof json.serverTime === 'string') clock.noteServerTime(json.serverTime);
+    return { status: res.status, headers: res.headers, json, bytes };
+  } finally {
+    clearTimeout(timer);
   }
-  clock.noteServerTime(res.headers.get('date'));
-  let json: Record<string, unknown> | null = null;
-  let bytes: Uint8Array | null = null;
-  const type = res.headers.get('content-type') ?? '';
-  try {
-    if (init.bytes && res.ok) bytes = new Uint8Array(await res.arrayBuffer());
-    else if (type.includes('json')) json = (await res.json()) as Record<string, unknown>;
-    else await res.arrayBuffer();
-  } catch (err) {
-    throw new KrtuworksError('network_error', `The answer from ${new URL(url).host} was cut: ${(err as Error)?.message ?? String(err)}`, res.status);
-  }
-  if (json && typeof json.serverTime === 'string') clock.noteServerTime(json.serverTime);
-  return { status: res.status, headers: res.headers, json, bytes };
 }
 
 /** A form body: the token endpoint wants one, and a browser sends it without a preflight. */

@@ -619,7 +619,7 @@ export class Krtuworks {
     const reason = this.presence.check(
       key,
       params,
-      { LEVEL: () => this.levels.inPlay?.level ?? null, SESSION_MINUTES: () => String(Math.floor(this.sessions.activeSeconds() / 60)) },
+      { LEVEL: () => this.levels.inPlay?.level ?? null, SESSION_MINUTES: () => String(Math.floor(this.sessions.sessionActiveSeconds() / 60)) },
       (line) => this.bugs.log(line),
     );
     return { applied: false, reason: reason ?? 'no_platform' };

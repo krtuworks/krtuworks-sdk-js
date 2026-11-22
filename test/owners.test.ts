@@ -108,6 +108,39 @@ test("a call refused 401 after the player changed is not sent again with the new
   }
 });
 
+test("a late account_merged answer for the player who left does not sign out the one who plays now (control: for the player still signed in, it does)", async () => {
+  for (const switched of [true, false]) {
+    const server = new FakeServer();
+    const { progress, store, identity } = await rig(server);
+    const changes: string[] = [];
+    identity.onChange((change) => changes.push(change.type));
+    await progress.learnKinds([{ key: 'coins', kind: 'SUM' }]);
+    await progress.report('add', 'coins', 5);
+    server.on('POST', '/v1/me/progress', async () => {
+      // While A's call is on its way the player becomes B (another tab signed B in, this one took it up);
+      // then A's answer arrives: A's account was merged.
+      if (switched) {
+        await anotherTabSignsIn(store);
+        await identity.credentials(true);
+      }
+      return { status: 401, json: { error: { code: 'account_merged', message: 'x' }, mergedInto: 'pw_target_cccccccccccc' } };
+    });
+    const out = await progress.flush();
+    const kept = await store.get<{ subject: string }>(TOKENS);
+    assert.equal(out.stoppedBy, 'account_merged');
+    assert.ok((await identity.waitingOwners()).includes(A), "A's queues wait for the merge check either way");
+    if (switched) {
+      assert.equal(identity.player?.subject, B, 'B plays on');
+      assert.equal(kept?.subject, B, "B's tokens stay");
+      assert.ok(!changes.includes('merged'), 'B is not told of a merge that was not its own');
+    } else {
+      assert.equal(identity.player, null, 'A, merged, is signed out');
+      assert.equal(kept, undefined);
+      assert.ok(changes.includes('merged'));
+    }
+  }
+});
+
 test("a save whose store write the player outlived is not sent with the new player's token (control: it is sent with its own)", async () => {
   for (const switched of [true, false]) {
     const server = new FakeServer();

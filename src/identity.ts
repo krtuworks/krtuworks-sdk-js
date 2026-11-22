@@ -260,16 +260,24 @@ export class Identity {
     throw signedOut();
   }
 
+  /**
+   * The merged player's queues wait for the merge check. Only when that player is still the signed-in one
+   * are its tokens dropped and the app told: a late answer for a player who already left must not sign
+   * out the one who plays now.
+   */
   private async markMergedLocked(previousSubject: string, mergedInto: string | null): Promise<never> {
     const meta = await this.meta();
     if (!meta.waitingOwners.includes(previousSubject)) meta.waitingOwners.push(previousSubject);
     await this.saveMeta(meta);
-    await this.adopt(null);
-    this.emit({ type: 'merged', previousSubject, mergedInto });
+    const stored = (await this.ctx.store.get<StoredTokens>(this.key('tokens'))) ?? null;
+    if (stored?.subject === previousSubject) {
+      await this.adopt(null);
+      this.emit({ type: 'merged', previousSubject, mergedInto });
+    }
     throw new KrtuworksError('account_merged', 'This account was merged into another one; sign in with it.', 401, null, { mergedInto });
   }
 
-  /** The server said the player's account went into another one (401 account_merged). */
+  /** The server said a player's account went into another one (401 account_merged on that player's call). */
   async markMerged(previousSubject: string, mergedInto: string | null): Promise<never> {
     return withLock(this.lockName, () => this.markMergedLocked(previousSubject, mergedInto));
   }

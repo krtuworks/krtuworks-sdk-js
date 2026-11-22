@@ -22,6 +22,8 @@ export class SessionKeeper {
   private heartbeatSeconds = 60;
   private activeMs = 0;
   private activeSince: number | null = performance.now();
+  /** The launch's time in use when the current session began: the server counts only what follows. */
+  private sessionBaseMs = 0;
   private opening: Promise<SessionInfo | null> | null = null;
 
   constructor(
@@ -37,10 +39,22 @@ export class SessionKeeper {
     return this.current && this.current.owner === owner ? this.current : null;
   }
 
+  private launchActiveMs(): number {
+    const live = this.activeSince !== null ? performance.now() - this.activeSince : 0;
+    return this.activeMs + live;
+  }
+
   /** Seconds in use in this launch (foreground only). */
   activeSeconds(): number {
-    const live = this.activeSince !== null ? performance.now() - this.activeSince : 0;
-    return Math.floor((this.activeMs + live) / 1000);
+    return Math.floor(this.launchActiveMs() / 1000);
+  }
+
+  /**
+   * Seconds in use since the current session began (foreground only): what the session reports. A session
+   * opened after another one (a new player, a timeout) starts from zero, not from the launch's total.
+   */
+  sessionActiveSeconds(): number {
+    return Math.floor(Math.max(0, this.launchActiveMs() - this.sessionBaseMs) / 1000);
   }
 
   setForeground(foreground: boolean): void {
@@ -64,7 +78,11 @@ export class SessionKeeper {
     const owner = this.subject();
     if (!owner) return null;
     if (this.current && this.current.owner !== owner) this.close();
-    this.clientSessionId ??= uuidV4();
+    if (!this.clientSessionId) {
+      // A new session (not an open sent again after a lost answer): its time in use starts now.
+      this.clientSessionId = uuidV4();
+      this.sessionBaseMs = this.launchActiveMs();
+    }
     const device = this.opts.device ?? undefined;
     const answer = await this.api.player('/v1/sessions', {
       method: 'POST',
@@ -98,7 +116,7 @@ export class SessionKeeper {
     try {
       const answer = await this.api.player(`/v1/sessions/${session.id}/heartbeat`, {
         method: 'POST',
-        json: { activeSeconds: this.activeSeconds(), foreground: this.activeSince !== null },
+        json: { activeSeconds: this.sessionActiveSeconds(), foreground: this.activeSince !== null },
         owner: session.owner,
       });
       const next = answer.json?.nextHeartbeatSeconds;
@@ -124,7 +142,7 @@ export class SessionKeeper {
     try {
       await this.api.player(`/v1/sessions/${session.id}/heartbeat`, {
         method: 'POST',
-        json: { activeSeconds: this.activeSeconds(), foreground: this.activeSince !== null },
+        json: { activeSeconds: this.sessionActiveSeconds(), foreground: this.activeSince !== null },
         owner: session.owner,
       });
     } catch (err) {
@@ -132,7 +150,7 @@ export class SessionKeeper {
     }
     this.close();
     // The session is ended even when its heartbeat failed, so the round leaves nothing open.
-    const ended = this.api.player(`/v1/sessions/${session.id}/end`, { method: 'POST', json: { activeSeconds: this.activeSeconds() }, owner: session.owner });
+    const ended = this.api.player(`/v1/sessions/${session.id}/end`, { method: 'POST', json: { activeSeconds: this.sessionActiveSeconds() }, owner: session.owner });
     if (failure) {
       await ended.catch(() => undefined);
       throw failure;
@@ -146,7 +164,7 @@ export class SessionKeeper {
     this.close();
     if (!session) return;
     await this.api
-      .player(`/v1/sessions/${session.id}/end`, { method: 'POST', json: { activeSeconds: this.activeSeconds() }, keepalive: true, owner: session.owner })
+      .player(`/v1/sessions/${session.id}/end`, { method: 'POST', json: { activeSeconds: this.sessionActiveSeconds() }, keepalive: true, owner: session.owner })
       .catch(() => undefined);
   }
 

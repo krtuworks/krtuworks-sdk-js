@@ -4,6 +4,13 @@ All notable changes to `@krtuworks/sdk`. Versions follow semantic versioning; a 
 
 ## Unreleased
 
+## 1.0.4 - 2026-11-22
+
+### Fixed
+- A late `account_merged` answer for a player who already left no longer signs out the player who plays now. Before, when a call made for one account was answered after the player had switched to another, the new player's tokens were dropped and the app was told of a merge that was not theirs. Now only the merged player is signed out; its queues still wait for the merge check.
+- A session reports only its own time in use. Before, a session opened after another one (a new player, a session the server closed after 30 minutes) started from the whole launch's time, so its first heartbeat could claim an hour of play the session never had. `SESSION_MINUTES` in rich presence counts the session too.
+- Every call ends within 30 seconds, answer included (the Unity and Unreal packages already did). Before, a connection that stayed open without finishing its answer held every queue sent after it, and `signOut()` that waits for them. A call cut short is sent again later; every call is safe to repeat.
+
 ## 1.0.3 - 2026-11-22
 
 ### Fixed
