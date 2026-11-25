@@ -34,6 +34,7 @@
 - Levels and deaths (`krtu.level.*`, `death`) are for games only; in an app they do nothing.
 - Cloud files: `krtu.files.save(slot, bytes)` and `krtu.files.read(slot)`. A save conflict (`file_conflict`) carries the current version: let the player choose, do not overwrite.
 - Check `krtu.gate()` at start: it tells about maintenance and a required update.
+- Ready-made screens: `import { createUi } from '@krtuworks/sdk/ui'`, `const ui = createUi(krtu)`, then `await ui.ensurePlayer()` before the game starts instead of calling `signInAsGuest` yourself. It shows the age and terms screen for a new guest, keeps a player under 13 offline, finishes a sign-in the page came back from, and never throws: it answers `signedIn`, `redirecting` or `offline`. Save with `await ui.save(slot, bytes, { base, name })` to let the player choose when another device saved first; a `kept: 'there'` answer carries the other save's bytes, which the game loads. Put `<krtuworks-sign-in>` and `<krtuworks-account>` where the page wants them. Change colours with the `--kw-*` CSS variables and sentences with `createUi(krtu, { texts: { 'age.title': '…' } })`; do not copy or restyle the screens' markup.
 - Errors are `KrtuworksError` with a `code`. A network error does not lose data: the SDK keeps what it has and sends it later.
 - Never put a server key or any other Krtuworks secret into app code. This package needs none.
 

@@ -15,6 +15,15 @@ await krtu.signInAsGuest({ birthDate: '2000-01-31' });
 krtu.track('screen_view', { screen: 'menu' });
 ```
 
+Ready-made screens for the age question, the sign-in button, the account chip and save conflicts:
+
+```ts
+import { createUi } from '@krtuworks/sdk/ui';
+
+const ui = createUi(krtu);
+await ui.ensurePlayer();
+```
+
 Your app's `krtuworks-config.json` comes from the app's Credentials page in the [partner console](https://partner.krtuworks.com).
 
 - Documentation: [partner.krtuworks.com/docs](https://partner.krtuworks.com/docs)

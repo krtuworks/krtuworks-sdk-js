@@ -4,6 +4,11 @@ All notable changes to `@krtuworks/sdk`. Versions follow semantic versioning; a 
 
 ## Unreleased
 
+## 1.0.5 - 2026-11-25
+
+### Added
+- Ready-made screens (`@krtuworks/sdk/ui`): `createUi(krtu)` and `await ui.ensurePlayer()` show the age and terms screen before a new guest, a screen for players under 13 (the game goes on offline and the screen is not shown again until their 13th birthday), the screen for newer terms, an error screen with Try again and Keep playing, and finish a sign-in the page came back from. `ui.save(slot, bytes, { base, name })` shows both saves when another device saved first and does what the player picks (`describeSave` adds the game's own chapter, play time or picture to each card). A guest gets the "link a Krtuworks ID" prompt in a corner when the SDK says it is time. `<krtuworks-sign-in>` and `<krtuworks-account>` are a sign-in button and an account chip with its menu. Colours, corners and font are CSS variables (`--kw-accent` …), every sentence can be replaced (`texts`), and a game that draws its own screens gets the same models through `KrtuworksUi` and its own `UiHost`.
+
 ## 1.0.4 - 2026-11-22
 
 ### Fixed
