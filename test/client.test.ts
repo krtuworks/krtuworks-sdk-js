@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Krtuworks } from '../src/client.js';
 import { isKrtuworksError } from '../src/errors.js';
 import { memoryStore } from '../src/store.js';
-import { FakeServer, guestRoutes, options } from './fakeServer.js';
+import { FakeServer, fakeJwt, guestRoutes, options } from './fakeServer.js';
 
 function configRoute(server: FakeServer, config: Record<string, unknown>, switches: unknown[] = [], startVersion = 1) {
   let version = startVersion;
@@ -368,4 +368,54 @@ test("a platform sync names the open session (the server mirrors only with the a
   assert.equal('sessionId' in quietBodies[0], false);
   assert.equal(quiet.count('POST', '/v1/sessions'), 0);
   await plain.shutdown();
+});
+
+test("another tab's different player taken up on a refresh is an identity change: listeners are told once and B gets a session (control: only a refresh of A is silent)", async () => {
+  const A = 'pw_guest_aaaaaaaaaaaa';
+  const B = 'pw_other_bbbbbbbbbbbb';
+  for (const otherPlayer of [true, false]) {
+    const server = new FakeServer();
+    guestRoutes(server, A);
+    configRoute(server, {});
+    acceptEvents(server, []);
+    const sessionFor: string[] = [];
+    server.on('POST', '/v1/sessions', (call) => {
+      const token = (call.headers.get('authorization') ?? '').replace(/^Bearer /, '');
+      sessionFor.push(JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString()).sub);
+      return { status: 201, json: { session: { id: `ses_${String(sessionFor.length).padStart(20, 'a')}`, startedAt: new Date().toISOString() }, heartbeatSeconds: 60, serverTime: new Date().toISOString() } };
+    });
+    const store = memoryStore();
+    const tab1 = await Krtuworks.initialize(options(server, { store, sessions: true }));
+    await tab1.signInAsGuest({ birthDate: '2000-01-01', acceptedTerms: 'TERMS:v1 PRIVACY:v1' });
+    await tab1.ready();
+    assert.deepEqual(sessionFor, [A]);
+    const changes: Array<{ type: string; subject?: string }> = [];
+    tab1.onIdentityChange((c) => changes.push({ type: c.type, subject: 'player' in c ? c.player.subject : undefined }));
+    let first = true;
+    server.on('GET', '/v1/me/bug-reports', async () => {
+      if (!first) return { json: { reports: [], serverTime: new Date().toISOString() } };
+      first = false;
+      // Tab 2 writes its tokens (B, or a fresher A) while tab 1's call is on its way; tab 1's token is then refused.
+      const exp = Math.floor(Date.now() / 1000) + 600;
+      const subject = otherPlayer ? B : A;
+      await store.set('krtu:buried.test.web:tokens', {
+        kind: 'guest', subject, username: null, picture: null,
+        accessToken: fakeJwt({ sub: subject, aud: 'devapi', exp, scope: 'app:player', n: 'tab2' }), accessExpiresAt: exp * 1000, refreshToken: 'rt-tab2',
+      });
+      return { status: 401, json: { error: { code: 'token_expired', message: 'x' } } };
+    });
+    if (otherPlayer) {
+      await assert.rejects(tab1.myBugReports(), (e: unknown) => isKrtuworksError(e, 'context_changed'));
+      await tab1.ready();
+      assert.deepEqual(changes, [{ type: 'guest', subject: B }], 'told exactly once, of B');
+      assert.equal(tab1.player?.subject, B);
+      assert.deepEqual(sessionFor, [A, B], "B's session opened by the settle after the change");
+    } else {
+      assert.deepEqual(await tab1.myBugReports(), []);
+      await tab1.ready();
+      assert.deepEqual(changes, [], 'a plain refresh by another tab is silent');
+      assert.deepEqual(sessionFor, [A]);
+    }
+    await tab1.shutdown();
+  }
 });

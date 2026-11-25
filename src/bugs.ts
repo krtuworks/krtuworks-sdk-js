@@ -66,6 +66,9 @@ const RING_EVENTS = 50;
 const EVENT_CHARS = 1800;
 /** The server takes at most 100 KB of events; the SDK's own part stays under it so it never costs the player's report. */
 const EVENTS_CHARS = 90_000;
+/** The server's JSON body limit is 256 KiB in bytes, so the SDK's own parts also stay under byte budgets: multi-byte text (CJK, emoji) takes up to three bytes a character. */
+const EVENTS_BYTES = 100_000;
+const LOG_BYTES = 90_000;
 const LOG_CHARS = 32_768;
 const LOG_LINE = 1000;
 const RETRY_MS = 60_000;
@@ -83,6 +86,13 @@ export function screenshotType(bytes: Uint8Array): string | null {
   const ascii = (from: number, to: number) => String.fromCharCode(...bytes.subarray(from, to));
   if (bytes.length >= 12 && ascii(0, 4) === 'RIFF' && ascii(8, 12) === 'WEBP') return 'image/webp';
   return null;
+}
+
+const encoder = new TextEncoder();
+
+/** The bytes a value takes in the request body. */
+function jsonBytes(value: unknown): number {
+  return encoder.encode(JSON.stringify(value)).length;
 }
 
 function refused(message: string): KrtuworksError {
@@ -111,7 +121,13 @@ export function reportBody(
     throw refused('position is {area, x, y, z?}');
   }
   let events = context.events;
-  while (events.length && JSON.stringify(events).length > EVENTS_CHARS) events = events.slice(1);
+  while (events.length && (JSON.stringify(events).length > EVENTS_CHARS || jsonBytes(events) > EVENTS_BYTES)) events = events.slice(1);
+  // The log keeps its newest lines.
+  let log = context.log;
+  while (log && jsonBytes(log) > LOG_BYTES) {
+    const cut = log.indexOf('\n');
+    log = cut < 0 ? '' : log.slice(cut + 1);
+  }
   const device = context.opts.device ? Object.fromEntries(Object.entries(context.opts.device).filter(([, v]) => v !== undefined && v !== null)) : null;
   return {
     reportId: context.reportId,
@@ -125,7 +141,7 @@ export function reportBody(
     ...(position ? { position: { area: position.area, x: position.x, y: position.y, ...(position.z !== undefined ? { z: position.z } : {}) } } : {}),
     ...(fps !== null ? { fps: Math.round(fps * 10) / 10 } : {}),
     ...(events.length ? { events } : {}),
-    ...(context.log ? { log: context.log } : {}),
+    ...(log ? { log } : {}),
   };
 }
 
@@ -149,10 +165,11 @@ export function newlyFixed(reports: BugReportView[], state: FixedState | undefin
  * after a lost answer gets the same report. The last events and log lines are kept in memory only.
  */
 export class BugReports {
-  private readonly events: Record<string, unknown>[] = [];
-  private logLines: string[] = [];
+  /** The history is kept with the owner it was made under; a report takes only its own owner's. */
+  private readonly events: Array<{ owner: string; entry: Record<string, unknown> }> = [];
+  private logLines: Array<{ owner: string; line: string }> = [];
   private logChars = 0;
-  private lastFps: number | null = null;
+  private lastFps: { owner: string; fps: number } | null = null;
   /** Reports that wait before their next try (in memory: a new launch tries them all again). */
   private readonly waitUntil = new Map<string, number>();
   private readonly fixedListeners = new Set<(report: BugReportView) => void>();
@@ -177,18 +194,19 @@ export class BugReports {
   noteEvent(event: WireEvent): void {
     const entry: Record<string, unknown> = { type: event.type, at: event.createdAt, ...(event.position ? { position: event.position } : {}) };
     if (event.data && JSON.stringify(event.data).length <= EVENT_CHARS) entry.data = event.data;
-    this.events.push(entry);
+    const owner = this.owner();
+    this.events.push({ owner, entry });
     if (this.events.length > RING_EVENTS) this.events.shift();
     const fps = event.type === 'performance' ? event.data?.fps : undefined;
-    if (typeof fps === 'number' && Number.isFinite(fps)) this.lastFps = fps;
+    if (typeof fps === 'number' && Number.isFinite(fps)) this.lastFps = { owner, fps };
   }
 
   /** A line for the next report's log (the app's own, and the errors the SDK told). */
   log(message: string): void {
     const line = `${new Date().toISOString()} ${String(message).slice(0, LOG_LINE)}`;
-    this.logLines.push(line);
+    this.logLines.push({ owner: this.owner(), line });
     this.logChars += line.length + 1;
-    while (this.logChars > LOG_CHARS && this.logLines.length) this.logChars -= this.logLines.shift()!.length + 1;
+    while (this.logChars > LOG_CHARS && this.logLines.length) this.logChars -= this.logLines.shift()!.line.length + 1;
   }
 
   async report(input: BugReportInput, level: string | null): Promise<{ reportId: string }> {
@@ -205,7 +223,15 @@ export class BugReports {
       screenshot = { bytes: raw.slice(), type };
     }
     const reportId = uuidV4();
-    const body = reportBody(input, { reportId, opts: this.opts, level, fps: this.lastFps, events: [...this.events], log: this.logLines.join('\n') });
+    const own = <T extends { owner: string }>(items: T[]) => items.filter((i) => i.owner === owner);
+    const body = reportBody(input, {
+      reportId,
+      opts: this.opts,
+      level,
+      fps: this.lastFps?.owner === owner ? this.lastFps.fps : null,
+      events: own(this.events).map((e) => e.entry),
+      log: own(this.logLines).map((l) => l.line).join('\n'),
+    });
     const waiting: Waiting = { reportId, madeAt: Date.now(), body, screenshot, bugId: null };
     await this.store.set(`${this.prefix(owner)}${reportId}`, waiting);
     const subject = this.subject();
@@ -218,9 +244,11 @@ export class BugReports {
     return (await this.store.keys(this.prefix(this.owner()))).length;
   }
 
-  /** Hands one owner's waiting reports to another (the anonymous queue to the first player, a confirmed merge). */
+  /** Hands one owner's waiting reports and history to another (the anonymous queue to the first player, a confirmed merge). */
   async move(from: string, to: string): Promise<void> {
     if (from === to) return;
+    for (const item of [...this.events, ...this.logLines]) if (item.owner === from) item.owner = to;
+    if (this.lastFps?.owner === from) this.lastFps.owner = to;
     for (const key of await this.store.keys(this.prefix(from))) {
       const w = await this.store.get<Waiting>(key);
       if (w) await this.store.set(`${this.prefix(to)}${w.reportId}`, w);

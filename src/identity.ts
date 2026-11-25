@@ -211,6 +211,15 @@ export class Identity {
     };
   }
 
+  /** Tokens another tab wrote for a different player are taken up like a sign-in here: the app and the client are told. */
+  private async adoptFromAnotherTab(stored: StoredTokens): Promise<void> {
+    const changed = this.tokens?.subject !== stored.subject;
+    await this.adopt(stored);
+    if (!changed) return;
+    const player = this.player!;
+    this.emit(player.kind === 'guest' ? { type: 'guest', player, created: false } : { type: 'signed_in', player, promoted: false });
+  }
+
   private async refresh(usedAccess: string): Promise<StoredTokens> {
     return withLock(this.lockName, async () => {
       const stored = (await this.ctx.store.get<StoredTokens>(this.key('tokens'))) ?? null;
@@ -219,9 +228,10 @@ export class Identity {
         throw signedOut();
       }
       if (stored.accessToken !== usedAccess && stored.accessExpiresAt - REFRESH_EARLY_MS > this.ctx.clock.serverNow()) {
-        await this.adopt(stored);
+        await this.adoptFromAnotherTab(stored);
         return stored;
       }
+      if (stored.subject !== this.tokens?.subject) await this.adoptFromAnotherTab(stored);
       if (!stored.refreshToken) {
         if (stored.kind === 'guest') return this.guestAgain(stored);
         await this.adopt(null);

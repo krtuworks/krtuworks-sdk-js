@@ -254,3 +254,78 @@ test("a player reports another player's picture by subject, with a reason from t
   assert.equal(seen.length, 2);
   await krtu.shutdown();
 });
+
+test("a report carries only its own player's events and log lines; control: the player's own stay", async () => {
+  const server = new FakeServer();
+  configRoute(server);
+  const reports = new Map<string, { id: string; body: any; shot: string | null }>();
+  bugRoutes(server, reports);
+  const store = memoryStore();
+  const krtu = await started(server, { store });
+  await krtu.signInAsGuest(TERMS);
+  await krtu.ready();
+  krtu.track('screen_view', { screen: 'a-menu' });
+  krtu.log('a line');
+  const a = await krtu.reportBug({ category: 'OTHER', description: 'from A' });
+  await krtu.signOut();
+  krtu.log('between players');
+  // Another person on the same device: a new device key, a new guest.
+  await store.delete('krtu:buried.test.web:deviceKey');
+  guestRoutes(server, 'pw_other_bbbbbbbbbbbb');
+  await krtu.signInAsGuest(TERMS);
+  await krtu.ready();
+  krtu.track('screen_view', { screen: 'b-menu' });
+  krtu.log('b line');
+  const b = await krtu.reportBug({ category: 'OTHER', description: 'from B' });
+  await krtu.flush();
+  const forA = reports.get(a.reportId)!.body;
+  assert.deepEqual(forA.events.map((e: any) => e.type), ['screen_view'], "A's report keeps A's event");
+  assert.match(forA.log, /a line/);
+  const forB = reports.get(b.reportId)!.body;
+  assert.deepEqual(forB.events.map((e: any) => e.data.screen), ['b-menu'], "B's report has no event of A");
+  assert.doesNotMatch(forB.log, /a line/);
+  assert.match(forB.log, /between players\n.*b line$/, 'what the app did with nobody signed in goes to the first player, as the queues do');
+  await krtu.shutdown();
+});
+
+test('what the SDK adds to a report is cut by bytes: multi-byte text stays under the server limit with the newest part kept; control: ASCII is cut as before', async () => {
+  const LIMIT = 262_144;
+  const opts = resolveOptions(options(new FakeServer()));
+  const cjk = '漢'.repeat(1700);
+  const events = Array.from({ length: 50 }, (_, i) => ({ type: 'screen_view', at: String(i), data: { text: cjk } }));
+  const log = Array.from({ length: 33 }, (_, i) => `${i} ${'字'.repeat(990)}`).join('\n');
+  const body = reportBody({ category: 'OTHER', description: '長'.repeat(4000) }, { reportId: 'r1', opts, level: null, fps: null, events, log }) as any;
+  assert.ok(new TextEncoder().encode(JSON.stringify(body)).length < LIMIT - 10_000, 'room left under the 256 KiB body limit');
+  assert.equal(body.events.at(-1).at, '49', 'the newest event stays');
+  assert.ok(body.events.length < 50);
+  const lines: string[] = body.log.split('\n');
+  assert.ok(lines.length < 33 && lines.every((l) => /^\d+ 字{990}$/.test(l)), 'whole lines, from the oldest cut');
+  assert.ok(lines.at(-1)!.startsWith('32 '), 'the newest log line stays');
+  // control: ASCII within the character budgets is not cut by the byte budgets
+  const ascii = Array.from({ length: 50 }, (_, i) => ({ type: 'screen_view', at: String(i), data: { screen: 's'.repeat(1790) } }));
+  const plain = reportBody({ category: 'OTHER', description: 'x' }, { reportId: 'r1', opts, level: null, fps: null, events: ascii, log: 'l'.repeat(32_768) }) as any;
+  assert.equal(plain.events.length, 48);
+  assert.equal(plain.log.length, 32_768);
+});
+
+test('a report of multi-byte events and log is taken by a server that refuses a body over 256 KiB (control: an ASCII one too)', async () => {
+  for (const text of ['漢', 'x']) {
+    const server = new FakeServer();
+    configRoute(server);
+    const reports = new Map<string, { id: string; body: any; shot: string | null }>();
+    bugRoutes(server, reports);
+    const keep = server['routes'].get('POST /v1/me/bug-reports')!;
+    server.on('POST', '/v1/me/bug-reports', (call) => (call.raw.length > 262_144 ? { status: 413, json: { error: { code: 'payload_too_large', message: 'big' } } } : keep(call)));
+    const krtu = await started(server);
+    await krtu.signInAsGuest(TERMS);
+    await krtu.ready();
+    for (let i = 0; i < 50; i += 1) krtu.track('screen_view', { text: text.repeat(1700), i });
+    for (let i = 0; i < 33; i += 1) krtu.log(text.repeat(990));
+    await krtu.reportBug({ category: 'OTHER', description: text.repeat(4000) });
+    const out = await krtu.flush();
+    assert.deepEqual(out.bugs.dropped, [], `kept, not refused for good (${text})`);
+    assert.equal(out.bugs.sent, 1);
+    assert.equal(reports.size, 1);
+    await krtu.shutdown();
+  }
+});
