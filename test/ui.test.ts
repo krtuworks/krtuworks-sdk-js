@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Krtuworks } from '../src/client.js';
 import { CURRENT_TERMS } from '../src/config.js';
-import { KrtuworksError } from '../src/errors.js';
+import { KrtuworksError, isKrtuworksError } from '../src/errors.js';
 import { memoryStore } from '../src/store.js';
 import { KrtuworksUi, errorScreen, memoryMemory, type UiAnswer, type UiHost, type UiScreen } from '../src/ui/core.js';
 import { checkBirth, dateOrder, turnsThirteen } from '../src/ui/format.js';
@@ -216,6 +216,39 @@ test('another device saved first: both saves are shown, the newer marked; keepin
       assert.equal(result.kept, 'here');
       assert.equal(bases.at(-1), theirs.id, 'saved over the version the player saw');
     }
+    await krtu.shutdown();
+  }
+});
+
+test('the player signs out while the conflict screen is open: nothing is returned or saved and the call ends context_changed; control: the same player gets the chosen bytes', async () => {
+  for (const changes of [true, false]) {
+    const server = new FakeServer();
+    guestRoutes(server);
+    const theirs = { id: 'fil_bbbbbbbbbbbbbbbbbbbb', slot: 'save-1', device: null, generation: 4, sizeBytes: 3, sha256: '', platform: 'STEAM', build: '1.0.0', savedAt: '2026-06-01T11:00:00Z', fromMerge: false };
+    let writes = 0;
+    server.on('GET', '/v1/apps/buried/files/save-1', () => ({ body: new Uint8Array([9, 9, 9]), headers: { etag: `"${theirs.id}"`, 'x-krtu-generation': '4', 'x-krtu-saved-at': theirs.savedAt } }));
+    server.on('PUT', '/v1/apps/buried/files/save-1', () => {
+      writes += 1;
+      return { status: 201, json: { file: theirs } };
+    });
+    const krtu = await start(server);
+    await krtu.signInAsGuest({ birthDate: '2000-01-01', acceptedTerms: CURRENT_TERMS });
+    await krtu.ready();
+    for (const card of [1, 0] as const) {
+      const host: UiHost = {
+        show: () => ({ answer: (changes ? krtu.signOut() : Promise.resolve()).then((): UiAnswer => ({ kind: 'keep', card })), close: () => undefined }),
+        remind: () => ({ answer: Promise.resolve('later' as const), close: () => undefined }),
+      };
+      const ui = new KrtuworksUi(krtu, host, { now: () => NOW, locale: 'en-GB' });
+      const run = ui.chooseSave({ slot: 'save-1', bytes: new Uint8Array([1, 2]), current: theirs });
+      if (changes) {
+        await assert.rejects(run, (err) => isKrtuworksError(err) && err.code === 'context_changed');
+        break;
+      }
+      const result = await run;
+      assert.equal(result.kept, card === 1 ? 'there' : 'here');
+    }
+    assert.equal(writes, changes ? 0 : 1, changes ? 'nothing saved for the other player' : 'keeping this one saved once');
     await krtu.shutdown();
   }
 });

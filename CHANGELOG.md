@@ -4,6 +4,11 @@ All notable changes to `@krtuworks/sdk`. Versions follow semantic versioning; a 
 
 ## Unreleased
 
+## 1.0.6 - 2026-11-25
+
+### Fixed
+- The save screens answer only for the player who opened them. Before, when the player signed out or another account signed in while the "which save to keep" screen was open, the choice and the save could reach the new account. Now `ui.save` and `ui.resolveMergedSaves` end with `context_changed` and nothing is saved.
+
 ## 1.0.5 - 2026-11-25
 
 ### Added

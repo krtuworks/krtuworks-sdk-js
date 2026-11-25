@@ -1,6 +1,6 @@
 import type { Krtuworks } from '../client.js';
 import { CURRENT_TERMS, ID_ORIGIN } from '../config.js';
-import { isKrtuworksError } from '../errors.js';
+import { isKrtuworksError, KrtuworksError } from '../errors.js';
 import type { FileVersion } from '../files.js';
 import type { Player } from '../identity.js';
 import { birthYears, checkBirth, dateOrder, fileSize, isoDate, savedWhen, turnsThirteen, type DateOrder } from './format.js';
@@ -219,9 +219,11 @@ export class KrtuworksUi {
 
   /** Two saves of `slot`: this device's `bytes` and the server's `current`. */
   async chooseSave(input: { slot: string; bytes: Uint8Array; current: FileVersion; name?: string }): Promise<ChooseResult> {
+    const owner = this.playerSubject();
     let current = input.current;
     for (;;) {
       const read = await this.client.files.read(input.slot);
+      this.assertSamePlayer(owner);
       if (!read?.version) return { kept: 'here', version: await this.client.files.save(input.slot, input.bytes, { base: null }) };
       const there = { ...current, id: read.version.id, generation: read.version.generation, savedAt: read.version.savedAt, sizeBytes: read.bytes.length };
       const theirs = read.bytes;
@@ -233,6 +235,7 @@ export class KrtuworksUi {
       hereCard.newer = hereNewer;
       thereCard.newer = !hereNewer;
       const answer = await this.once({ kind: 'conflict', slot: input.name ?? input.slot, cards: [hereCard, thereCard] });
+      this.assertSamePlayer(owner);
       if (answer.kind === 'keep' && answer.card === 1) return { kept: 'there', version: there, bytes: theirs };
       try {
         return { kept: 'here', version: await this.client.files.save(input.slot, input.bytes, { base: there.id }) };
@@ -246,17 +249,21 @@ export class KrtuworksUi {
 
   /** After two accounts were merged: every slot holding two versions asks the player which to keep. */
   async resolveMergedSaves(): Promise<Array<{ slot: string; kept: FileVersion }>> {
+    const owner = this.playerSubject();
     const { slots } = await this.client.files.list();
+    this.assertSamePlayer(owner);
     const out: Array<{ slot: string; kept: FileVersion }> = [];
     for (const slot of slots) {
       if (!slot.conflict || !slot.file) continue;
       const read = await this.client.files.read(slot.key);
+      this.assertSamePlayer(owner);
       const currentCard = await this.card(this.t('conflict.current'), slot.file.savedAt, slot.file.sizeBytes, slot.key, read?.bytes ?? null);
       const mergedCard = await this.card(this.t('conflict.merged'), slot.conflict.savedAt, slot.conflict.sizeBytes, slot.key, null);
       const mergedNewer = new Date(slot.conflict.savedAt).getTime() > new Date(slot.file.savedAt).getTime();
       currentCard.newer = !mergedNewer;
       mergedCard.newer = mergedNewer;
       const answer = await this.once({ kind: 'conflict', slot: slot.name || slot.key, cards: [currentCard, mergedCard] });
+      this.assertSamePlayer(owner);
       const keep = answer.kind === 'keep' && answer.card === 1 ? slot.conflict : slot.file;
       out.push({ slot: slot.key, kept: await this.client.files.resolve(slot.key, keep.id, slot.file.id) });
     }
@@ -362,6 +369,15 @@ export class KrtuworksUi {
       }
     }
     return { label, newer: false, when: savedWhen(savedAt, this.now(), this.locale, this.texts), size: fileSize(sizeBytes), summary };
+  }
+
+  private playerSubject(): string | null {
+    return this.client.player?.subject ?? null;
+  }
+
+  /** The player who opened a save screen is the one who answers it; otherwise their bytes or choice would reach another account. */
+  private assertSamePlayer(owner: string | null): void {
+    if (this.playerSubject() !== owner) throw new KrtuworksError('context_changed', 'The player changed while the save screen was open; nothing was saved.');
   }
 
   private async once(screen: UiScreen): Promise<UiAnswer> {
