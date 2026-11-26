@@ -106,6 +106,8 @@ export class Files {
   private seq = 0;
   /** Per lane: when a settings write last went out and the one waiting for its turn. */
   private readonly writes = new Map<string, LaneWrites>();
+  /** Per lane: the saves still being hashed and stored, so they join the lane in the order they were made. */
+  private readonly entering = new Map<string, Promise<void>>();
 
   constructor(
     private readonly opts: ResolvedOptions,
@@ -137,7 +139,7 @@ export class Files {
   }
 
   /** One lane per player, slot and device: its saves go one at a time, oldest first. */
-  private laneLock(upload: PendingUpload): string {
+  private laneLock(upload: Pick<PendingUpload, 'owner' | 'slot' | 'device'>): string {
     return `krtu:${this.opts.clientId}:uploadLane:${JSON.stringify([upload.owner, upload.slot, upload.device ?? null])}`;
   }
 
@@ -216,23 +218,40 @@ export class Files {
     if (!owner) throw new KrtuworksError('signed_out', 'No player is signed in.');
     const revisionKey = this.revisionKey(slot, options.device);
     this.revisions.set(revisionKey, (this.revisions.get(revisionKey) ?? 0) + 1);
-    const upload: PendingUpload = {
-      uploadId: uuidV4(),
-      owner,
-      slot,
-      device: options.device ?? null,
-      base: options.base ?? null,
-      conditional: options.base !== undefined,
-      sha256: await sha256Hex(data),
-      bytes: data,
-      deviceInfo: options.deviceInfo ?? null,
-      savedAt: Date.now(),
-      seq: (this.seq += 1),
-      v: 2,
-    };
-    await this.store.set(this.uploadKey(upload.uploadId), upload);
-    if (!upload.conditional) return this.paced(upload);
-    return this.writeNow(upload);
+    // The order is taken when the game saves, not when hashing ends: a large save hashed after a smaller,
+    // newer one must still count as the older.
+    const savedAt = Date.now();
+    const seq = (this.seq += 1);
+    const device = options.device ?? null;
+    const lane = this.laneLock({ owner, slot, device });
+    const step = (this.entering.get(lane) ?? Promise.resolve()).then(async () => {
+      const upload: PendingUpload = {
+        uploadId: uuidV4(),
+        owner,
+        slot,
+        device,
+        base: options.base ?? null,
+        conditional: options.base !== undefined,
+        sha256: await sha256Hex(data),
+        bytes: data,
+        deviceInfo: options.deviceInfo ?? null,
+        savedAt,
+        seq,
+        v: 2,
+      };
+      await this.store.set(this.uploadKey(upload.uploadId), upload);
+      // Joining the lane happens inside the step, so the saves of a lane join it in the order they were made.
+      return { sent: upload.conditional ? this.writeNow(upload) : this.paced(upload) };
+    });
+    const tail = step.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.entering.set(lane, tail);
+    void tail.then(() => {
+      if (this.entering.get(lane) === tail) this.entering.delete(lane);
+    });
+    return (await step).sent;
   }
 
   /** Sends a save at once; a `too_many_writes` answer is tried again after its Retry-After. */
@@ -305,6 +324,7 @@ export class Files {
 
   /** Sends the settings saves waiting for their turn now (the app pauses or ends). */
   async flushWrites(): Promise<void> {
+    await Promise.all([...this.entering.values()]);
     await Promise.all([...this.writes.keys()].map((lane) => this.release(lane)));
   }
 

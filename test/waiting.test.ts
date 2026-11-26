@@ -233,6 +233,33 @@ test('a settings slot takes one write per window, the newest content winning (co
   assert.deepEqual(based, ['a', 'b'], 'no waiting for a save with a base');
 });
 
+test('a large settings save started before a small newer one never lands after it (control: saves awaited in turn go in turn)', async () => {
+  const enc = (t: string) => new TextEncoder().encode(t);
+  const large = new Uint8Array(4 * 1024 * 1024).fill(65);
+  for (const windowMs of [0, 60_000]) {
+    const server = new FakeServer();
+    const { files } = await rig(server, memoryStore(), windowMs);
+    const taken: string[] = [];
+    settingsRoute(server, taken);
+    await files.save('settings', enc('v1'));
+    const older = files.save('settings', large);
+    const newer = files.save('settings', enc('B'));
+    if (windowMs) await files.flushWrites();
+    const outcome = await Promise.allSettled([older, newer]);
+    assert.equal(taken[taken.length - 1], 'B', `the newest content is the last written (window ${windowMs})`);
+    if (outcome[0].status === 'rejected') assert.ok(isKrtuworksError(outcome[0].reason, 'save_replaced'));
+    assert.equal(outcome[1].status, 'fulfilled');
+  }
+  const server = new FakeServer();
+  const { files } = await rig(server);
+  const taken: string[] = [];
+  settingsRoute(server, taken);
+  await files.save('settings', enc('B'));
+  await files.save('settings', large);
+  assert.equal(taken.length, 2);
+  assert.notEqual(taken[1], 'B', 'awaited in turn, the later save is the last written');
+});
+
 test('flushWrites sends the held settings now (control: nothing is sent while the window runs)', async () => {
   const server = new FakeServer();
   const { files } = await rig(server, memoryStore(), 60_000);

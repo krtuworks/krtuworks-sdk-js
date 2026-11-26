@@ -4,6 +4,11 @@ All notable changes to `@krtuworks/sdk`. Versions follow semantic versioning; a 
 
 ## Unreleased
 
+## 1.0.10 - 2026-11-26
+
+### Fixed
+- Two settings saves started back to back can no longer land in the wrong order. Before, a large save started first could be stored after a smaller save started later, because its order was taken only after its content was hashed; the older settings then replaced the newer ones on the server.
+
 ## 1.0.9 - 2026-11-26
 
 ### Fixed
