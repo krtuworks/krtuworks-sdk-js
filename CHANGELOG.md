@@ -4,6 +4,13 @@ All notable changes to `@krtuworks/sdk`. Versions follow semantic versioning; a 
 
 ## Unreleased
 
+## 1.0.9 - 2026-11-26
+
+### Fixed
+- An A/B group's value (`value`) is used only while the `abTests` module is on; switching the module off now gives the config's own value. Before, the group's value stayed in force.
+- A new player starts without the last player's A/B values and statistics choice. Before, after an account change `value` kept the previous player's groups until `refreshExperiments` ran, and a player with no choice kept on the device inherited the previous player's statistics opt-out when the server could not be asked. An A/B or opt-out answer that arrives after the player changed is not applied.
+- `shutdown()` while a session open is still on its way no longer lets the late answer reopen the session or send heartbeats; the session the late answer names is ended.
+
 ## 1.0.8 - 2026-11-26
 
 ### Fixed

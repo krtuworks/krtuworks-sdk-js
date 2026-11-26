@@ -165,6 +165,8 @@ export class Krtuworks {
   private readonly fetchFn: typeof fetch;
   private optedOut = false;
   private experiments = new Map<string, unknown>();
+  /** Set by `shutdown`: nothing opens again afterwards (a late sign-in answer included). */
+  private stopped = false;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private configTimer: ReturnType<typeof setInterval> | null = null;
   private readonly mergeListeners = new Set<(merge: MergeSettled) => void>();
@@ -276,26 +278,32 @@ export class Krtuworks {
   }
 
   private identityChanged(change: IdentityChange): void {
-    if (change.type === 'merging') return;
+    if (change.type === 'merging' || this.stopped) return;
     if (change.type === 'signed_out' && change.reason === 'account_deleted' && change.subject) void this.dropOwner(change.subject).catch(() => undefined);
     if (change.type === 'merged' || change.type === 'signed_out' || change.type === 'deletion_pending' || change.type === 'sanctioned') {
       this.sessions.close();
-      this.presence.forget();
-      this.licences.forget();
+      this.forgetPlayer();
       this.sessionOwner = null;
       return;
     }
     // A guest that became a Krtuworks ID is the same player: its session goes on.
     if (this.sessionOwner !== change.player.subject) {
       this.sessions.close();
-      this.presence.forget();
-      this.licences.forget();
+      this.forgetPlayer();
     }
     this.sessionOwner = change.player.subject;
     this.events.resetBackoff();
     this.progress.resetBackoff();
     this.bugs.resetBackoff();
     this.settling = this.settling.then(() => this.settle()).catch(() => undefined);
+  }
+
+  /** What the last player's answers left in memory: the next player starts from the app's own values. */
+  private forgetPlayer(): void {
+    this.presence.forget();
+    this.licences.forget();
+    this.experiments = new Map();
+    this.optedOut = false;
   }
 
   /** The account of `subject` is gone: everything waiting for it on this device is dropped. */
@@ -310,6 +318,7 @@ export class Krtuworks {
    * server could not make on an earlier launch is tried again.
    */
   private async settle(): Promise<void> {
+    if (this.stopped) return;
     const player = this.identity.player;
     if (!player) {
       if ((await this.identity.meta()).guestRequest) await this.identity.signInAsGuest().catch(() => undefined);
@@ -321,6 +330,7 @@ export class Krtuworks {
     await this.settleMerges(player.subject).catch(() => undefined);
     await this.readOptOut().catch(() => undefined);
     await this.licences.ensureLoaded();
+    if (this.stopped) return;
     if (this.options.sessions && this.config.moduleOn('sessions')) await this.sessions.start();
     await this.refreshLicences();
     await this.refreshPresence();
@@ -496,12 +506,15 @@ export class Krtuworks {
   }
 
   private async readOptOut(): Promise<void> {
-    const kept = await this.store.get<boolean>(this.optOutKey());
-    if (kept !== undefined) this.optedOut = kept;
+    const key = this.optOutKey();
+    // A player with nothing kept on this device is on until the server says otherwise.
+    this.optedOut = (await this.store.get<boolean>(key)) ?? false;
     if (!this.identity.player) return;
     const answer = await this.api.player('/v1/me/telemetry-opt-out');
+    // Another player came in while the answer was on its way: it is not theirs.
+    if (this.optOutKey() !== key) return;
     this.optedOut = answer.json?.optedOut === true;
-    await this.store.set(this.optOutKey(), this.optedOut);
+    await this.store.set(key, this.optedOut);
   }
 
   // ── Progress ──────────────────────────────────────────────────────────────
@@ -716,15 +729,18 @@ export class Krtuworks {
 
   /** The player's A/B groups; their values take over the config's (`value`). */
   async refreshExperiments(): Promise<Array<{ key: string; configKey: string; group: string; value: unknown }>> {
+    const subject = this.identity.player?.subject ?? null;
     const answer = await this.api.player('/v1/me/experiments');
     const list = (answer.json?.experiments as Array<{ key: string; configKey: string; group: string; value: unknown }>) ?? [];
-    this.experiments = new Map(list.map((e) => [e.configKey, e.value]));
+    // Another player came in while the answer was on its way: their groups are not these.
+    if ((this.identity.player?.subject ?? null) === subject) this.experiments = new Map(list.map((e) => [e.configKey, e.value]));
     return list;
   }
 
-  /** A remote config value, the player's A/B group's when one varies it. */
+  /** A remote config value, the player's A/B group's when one varies it (only while the A/B module is on). */
   value<T = unknown>(key: string, fallback?: T): T | undefined {
-    return this.experiments.has(key) ? (this.experiments.get(key) as T) : this.config.get<T>(key, fallback);
+    if (this.experiments.has(key) && this.config.moduleOn('abTests')) return this.experiments.get(key) as T;
+    return this.config.get<T>(key, fallback);
   }
 
   async getStatus(): Promise<Record<string, unknown>> {
@@ -905,6 +921,7 @@ export class Krtuworks {
 
   /** Stops the SDK: the level in play ends as a quit, the session ends, what waits is written to the store. */
   async shutdown(): Promise<void> {
+    this.stopped = true;
     for (const t of [this.flushTimer, this.configTimer]) if (t) clearInterval(t);
     if (this.flushSoon) clearTimeout(this.flushSoon);
     for (const off of this.detach.splice(0)) off();

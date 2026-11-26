@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Krtuworks } from '../src/client.js';
 import { isKrtuworksError } from '../src/errors.js';
 import { memoryStore } from '../src/store.js';
-import { FakeServer, fakeJwt, guestRoutes, options } from './fakeServer.js';
+import { FakeServer, fakeJwt, guestRoutes, options, tokenAnswer } from './fakeServer.js';
 
 function configRoute(server: FakeServer, config: Record<string, unknown>, switches: unknown[] = [], startVersion = 1) {
   let version = startVersion;
@@ -430,5 +430,123 @@ test("another tab's different player taken up on a refresh is an identity change
       assert.deepEqual(sessionFor, [A]);
     }
     await tab1.shutdown();
+  }
+});
+
+const GUEST = { birthDate: '2000-01-01', acceptedTerms: 'TERMS:v1 PRIVACY:v1' };
+
+/** From now on the device's guest key signs in as `sub` (another player on the same device). */
+function signInAs(server: FakeServer, sub: string): void {
+  server.on('POST', '/oidc/token', () => ({ json: tokenAnswer(sub) }));
+}
+
+test("an A/B group's value is used only while the A/B module is on (control: with the module on the group's value wins)", async () => {
+  for (const abOn of [true, false]) {
+    const server = new FakeServer();
+    guestRoutes(server);
+    configRoute(server, { difficulty: 100, ...(abOn ? {} : { modules: { abTests: false } }) });
+    acceptEvents(server, []);
+    server.on('GET', '/v1/me/experiments', () => ({ json: { experiments: [{ key: 'exp_hard', configKey: 'difficulty', group: 'B', value: 200 }] } }));
+    const krtu = await Krtuworks.initialize(options(server));
+    await krtu.signInAsGuest(GUEST);
+    await krtu.ready();
+    await krtu.refreshExperiments();
+    assert.equal(krtu.value('difficulty'), abOn ? 200 : 100);
+    await krtu.shutdown();
+  }
+});
+
+test("another player does not inherit the last player's A/B values or statistics choice (control: B's own answers apply)", async () => {
+  const A = 'pw_guest_aaaaaaaaaaaa';
+  const B = 'pw_other_bbbbbbbbbbbb';
+  const server = new FakeServer();
+  guestRoutes(server, A);
+  configRoute(server, { difficulty: 100 });
+  acceptEvents(server, []);
+  let optedOut = true;
+  server.on('GET', '/v1/me/telemetry-opt-out', () => ({ json: { optedOut, updatedAt: null } }));
+  let groupValue = 200;
+  server.on('GET', '/v1/me/experiments', () => ({ json: { experiments: [{ key: 'exp_hard', configKey: 'difficulty', group: 'B', value: groupValue }] } }));
+  const krtu = await Krtuworks.initialize(options(server));
+  await krtu.signInAsGuest(GUEST);
+  await krtu.ready();
+  await krtu.refreshExperiments();
+  assert.equal(krtu.value('difficulty'), 200);
+  assert.equal(krtu.track('button', { name: 'x' }), false, 'A turned statistics off');
+
+  await krtu.signOut();
+  signInAs(server, B);
+  // B's choice cannot be read (no answer): B has none kept, so B is on.
+  server.offline.add('/v1/me/telemetry-opt-out');
+  await krtu.signInAsGuest(GUEST);
+  await krtu.ready();
+  assert.equal(krtu.player?.subject, B);
+  assert.equal(krtu.value('difficulty'), 100, "A's group is gone");
+  assert.equal(krtu.track('button', { name: 'x' }), true, "A's choice is gone");
+
+  server.offline.delete('/v1/me/telemetry-opt-out');
+  groupValue = 150;
+  await krtu.refreshExperiments();
+  assert.equal(krtu.value('difficulty'), 150, "B's own group");
+  assert.equal(await krtu.getTelemetryOptOut(), true, "B's own choice");
+  await krtu.shutdown();
+});
+
+test('an A/B answer that arrives after the player changed is not kept for the new player', async () => {
+  const B = 'pw_other_bbbbbbbbbbbb';
+  const server = new FakeServer();
+  guestRoutes(server);
+  configRoute(server, { difficulty: 100 });
+  acceptEvents(server, []);
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  server.on('GET', '/v1/me/experiments', async () => {
+    await held;
+    return { json: { experiments: [{ key: 'exp_hard', configKey: 'difficulty', group: 'B', value: 200 }] } };
+  });
+  const krtu = await Krtuworks.initialize(options(server));
+  await krtu.signInAsGuest(GUEST);
+  await krtu.ready();
+  const asked = krtu.refreshExperiments().catch((e) => e);
+  await new Promise((r) => setTimeout(r, 20));
+  await krtu.signOut();
+  signInAs(server, B);
+  await krtu.signInAsGuest(GUEST);
+  await krtu.ready();
+  release();
+  await asked;
+  assert.equal(krtu.player?.subject, B);
+  assert.equal(krtu.value('difficulty'), 100);
+  await krtu.shutdown();
+});
+
+test('a session open still on its way when the SDK shuts down does not come back: no heartbeat, the late session is ended (control: a normal open beats)', async () => {
+  for (const shutDown of [true, false]) {
+    const server = new FakeServer();
+    guestRoutes(server);
+    configRoute(server, {});
+    acceptEvents(server, []);
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    server.on('POST', '/v1/sessions', async () => {
+      await held;
+      return { status: 201, json: { session: { id: 'ses_aaaaaaaaaaaaaaaaaaaa', startedAt: new Date().toISOString() }, heartbeatSeconds: 0.05, serverTime: new Date().toISOString() } };
+    });
+    server.onPrefix('POST', '/v1/sessions/', () => ({ json: { nextHeartbeatSeconds: 0.05 } }));
+    const krtu = await Krtuworks.initialize(options(server, { sessions: true }));
+    await krtu.signInAsGuest(GUEST);
+    await new Promise((r) => setTimeout(r, 30));
+    if (shutDown) await krtu.shutdown();
+    release();
+    await krtu.ready();
+    await new Promise((r) => setTimeout(r, 200));
+    const beats = server.count('POST', '/v1/sessions/ses_aaaaaaaaaaaaaaaaaaaa/heartbeat');
+    if (shutDown) {
+      assert.equal(beats, 0, 'no heartbeat after shutdown');
+      assert.equal(server.count('POST', '/v1/sessions/ses_aaaaaaaaaaaaaaaaaaaa/end'), 1, 'the session the late answer named is ended');
+    } else {
+      assert.ok(beats >= 1, 'a session that opened normally beats');
+      await krtu.shutdown();
+    }
   }
 });

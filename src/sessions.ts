@@ -31,6 +31,8 @@ export class SessionKeeper {
   private wanted = false;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private retryMs = 0;
+  /** Moves on every `close`: an answer that arrives after it belongs to a session nobody wants any more. */
+  private generation = 0;
 
   constructor(
     private readonly opts: ResolvedOptions,
@@ -137,6 +139,7 @@ export class SessionKeeper {
       this.sessionBaseMs = this.launchActiveMs();
     }
     const device = this.opts.device ?? undefined;
+    const generation = this.generation;
     const answer = await this.api.player('/v1/sessions', {
       method: 'POST',
       json: {
@@ -149,6 +152,11 @@ export class SessionKeeper {
       owner,
     });
     const session = answer.json?.session as { id: string; startedAt: string } | undefined;
+    if (session && this.generation !== generation) {
+      // Closed while the open was on its way (the SDK shut down, the player left): the server's session ends now.
+      void this.api.player(`/v1/sessions/${session.id}/end`, { method: 'POST', json: { activeSeconds: 0 }, keepalive: true, owner }).catch(() => undefined);
+      return null;
+    }
     if (!session || this.subject() !== owner) return null;
     this.current = { id: session.id, owner, startedAt: session.startedAt };
     await this.onEntitlements(answer.json?.entitlements).catch(() => undefined);
@@ -166,6 +174,7 @@ export class SessionKeeper {
   async heartbeat(): Promise<void> {
     const session = this.session;
     if (!session) return;
+    const generation = this.generation;
     try {
       const answer = await this.api.player(`/v1/sessions/${session.id}/heartbeat`, {
         method: 'POST',
@@ -175,6 +184,7 @@ export class SessionKeeper {
       const next = answer.json?.nextHeartbeatSeconds;
       if (typeof next === 'number' && next > 0) this.heartbeatSeconds = next;
     } catch (err) {
+      if (this.generation !== generation) return;
       if (isKrtuworksError(err) && (err.code === 'session_ended' || err.code === 'session_not_found')) {
         // The server closed it (30 minutes without a heartbeat): a new one, with a new id.
         this.current = null;
@@ -223,6 +233,7 @@ export class SessionKeeper {
 
   /** Forgets the session without telling the server (the player changed: it times out there). */
   close(): void {
+    this.generation += 1;
     this.reset();
     this.wanted = false;
     this.retryMs = 0;
