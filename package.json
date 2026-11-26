@@ -1,6 +1,6 @@
 {
   "name": "@krtuworks/sdk",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Krtuworks SDK for web games and apps: Krtuworks ID sign-in, guests, sessions, events, progress, cloud files and remote config.",
   "type": "module",
   "main": "dist/index.js",

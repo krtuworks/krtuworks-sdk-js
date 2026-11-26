@@ -1,3 +1,4 @@
+import { sampleInterval } from './positions.js';
 import type { KrtuStore } from './store.js';
 
 export type Environment = 'TEST' | 'LIVE';
@@ -19,7 +20,7 @@ export interface KrtuworksAppConfig {
 }
 
 /** The modules only a game has: levels (progression) and deaths (combat). */
-export const GAME_MODULES: readonly Module[] = ['progression', 'combat'];
+export const GAME_MODULES: readonly Module[] = ['progression', 'combat', 'positions'];
 
 export interface DeviceInfo {
   os?: string;
@@ -50,6 +51,8 @@ export interface KrtuworksOptions {
   locale?: string;
   /** Opens a session and keeps it alive while the app runs. Default true. */
   sessions?: boolean;
+  /** How often `samplePosition` tells where the player is, in seconds (1-600). Default 10. */
+  positionSampleSeconds?: number;
   idOrigin?: string;
   devOrigin?: string;
 }
@@ -67,7 +70,7 @@ export const CURRENT_TERMS = 'TERMS:v1 PRIVACY:v1';
 /** The SDK modules the owner switches per app (`config.modules`); a module that is off makes nothing. */
 export const MODULES = [
   'sessions', 'progression', 'combat', 'economy', 'items', 'ui', 'performance', 'settings', 'errors',
-  'bugReports', 'achievements', 'stats', 'cloudSave', 'remoteConfig', 'abTests', 'customEvents', 'leaderboards', 'presence',
+  'bugReports', 'achievements', 'stats', 'cloudSave', 'remoteConfig', 'abTests', 'customEvents', 'leaderboards', 'presence', 'positions',
 ] as const;
 export type Module = (typeof MODULES)[number];
 
@@ -79,6 +82,7 @@ export const FAMILY_MODULE: Readonly<Record<string, Module>> = {
   progression: 'progression',
   death: 'combat',
   damage: 'combat',
+  position_sample: 'positions',
   economy: 'economy',
   balance: 'economy',
   item: 'items',
@@ -112,6 +116,7 @@ export interface ResolvedOptions {
   device: DeviceInfo | null;
   locale: string | null;
   sessions: boolean;
+  positionSampleSeconds: number;
 }
 
 export function resolveOptions(options: KrtuworksOptions): ResolvedOptions {
@@ -141,5 +146,6 @@ export function resolveOptions(options: KrtuworksOptions): ResolvedOptions {
     device: options.device ?? null,
     locale: options.locale ?? null,
     sessions: options.sessions ?? true,
+    positionSampleSeconds: sampleInterval(options.positionSampleSeconds),
   };
 }

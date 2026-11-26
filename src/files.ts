@@ -281,7 +281,8 @@ export class Files {
       },
       Math.max(1000, (retryAfter ?? WRITE_RETRY_MS / 1000) * 1000),
     );
-    (timer as { unref?: () => void }).unref?.();
+    // A caller awaiting the save keeps the process up until it lands; a background retry does not.
+    if (!held) (timer as { unref?: () => void }).unref?.();
   }
 
   /**
@@ -299,10 +300,8 @@ export class Files {
       if (older) void this.forget(older.upload.uploadId).then(() => older.reject(replaced()));
       const wait = writes.lastAt + this.settingsWriteMs - Date.now();
       if (wait <= 0) void this.release(lane);
-      else if (!writes.timer) {
-        writes.timer = setTimeout(() => void this.release(lane), wait);
-        (writes.timer as { unref?: () => void }).unref?.();
-      }
+      // Not unref'd: the caller awaits this save, so the process stays up until it goes (at most settingsWriteMs).
+      else if (!writes.timer) writes.timer = setTimeout(() => void this.release(lane), wait);
     });
   }
 

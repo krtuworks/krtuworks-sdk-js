@@ -9,6 +9,7 @@ import type { Family, FamilyData } from './families.js';
 import { Files } from './files.js';
 import { Identity, type IdentityChange, type Player } from './identity.js';
 import { Entitlements, type Entitlement } from './entitlements.js';
+import { PositionSampler } from './positions.js';
 import { Presence, type PresenceResult } from './presence.js';
 import { ProgressionTracker, type LevelRef } from './progression.js';
 import { ProgressQueue, type SortOrder, type StatKind, type UploadMethod } from './progress.js';
@@ -162,6 +163,7 @@ export class Krtuworks {
   private readonly bugs: BugReports;
   private readonly presence: Presence;
   private readonly licences: Entitlements;
+  private readonly positions: PositionSampler;
   private readonly fetchFn: typeof fetch;
   private optedOut = false;
   private experiments = new Map<string, unknown>();
@@ -192,6 +194,7 @@ export class Krtuworks {
     this.config = new RemoteConfig(this.options, this.api, this.store);
     this.bugs = new BugReports(this.options, this.store, this.api, () => subject() ?? ANON, subject);
     this.presence = new Presence(this.options.clientId, this.store, this.api, subject);
+    this.positions = new PositionSampler(this.options.positionSampleSeconds);
     this.files = new Files(this.options, this.api, this.store, subject, () => this.identity.generation, () => void this.remindLinking('first_save').catch(() => undefined));
     this.levels = new ProgressionTracker(
       this.store,
@@ -300,6 +303,7 @@ export class Krtuworks {
 
   /** What the last player's answers left in memory: the next player starts from the app's own values. */
   private forgetPlayer(): void {
+    this.positions.reset();
     this.presence.forget();
     this.licences.forget();
     this.experiments = new Map();
@@ -422,6 +426,27 @@ export class Krtuworks {
       'death',
       { cause, ...(extra.enemy ? { enemy: extra.enemy } : {}), ...(place?.world ? { world: place.world } : {}), ...(place?.level ? { level: place.level } : {}) },
       { position: extra.position },
+    );
+  }
+
+  /**
+   * Where the player is now: call it as often as the game likes (every frame is fine). At most one
+   * `position_sample` goes out per `positionSampleSeconds` of active play, carrying the seconds since the one
+   * before, with the level in play. Games only, with the positions module on; returns whether a sample was kept.
+   */
+  samplePosition(position: EventPosition): boolean {
+    if (!this.options.game) return false;
+    if (!position || (position.space !== 'world' && position.space !== 'screen') || typeof position.area !== 'string' || !position.area) {
+      throw new TypeError('position is {space: world|screen, area, x, y, z?}');
+    }
+    if (![position.x, position.y, position.z ?? 0].every((n) => typeof n === 'number' && Number.isFinite(n))) throw new TypeError('position x, y and z are finite numbers');
+    const seconds = this.positions.due(this.sessions.activeSeconds());
+    if (seconds === null) return false;
+    const place = this.levels.inPlay;
+    return this.track(
+      'position_sample',
+      { seconds, ...(place?.world ? { world: place.world } : {}), ...(place?.level ? { level: place.level } : {}) },
+      { position },
     );
   }
 

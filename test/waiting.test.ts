@@ -275,6 +275,24 @@ test('flushWrites sends the held settings now (control: nothing is sent while th
   assert.deepEqual(taken, ['v1', 'v2']);
 });
 
+test('a held settings save keeps Node running until it goes (control: once sent, nothing holds the process)', async () => {
+  const server = new FakeServer();
+  const { files } = await rig(server, memoryStore(), 60_000);
+  const taken: string[] = [];
+  settingsRoute(server, taken);
+  const enc = (t: string) => new TextEncoder().encode(t);
+  const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+  await files.save('settings', enc('v1'));
+  const before = timers();
+  const held = files.save('settings', enc('v2'));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(timers(), before + 1, 'the held save keeps the event loop alive');
+  await files.flushWrites();
+  await held;
+  assert.deepEqual(taken, ['v1', 'v2']);
+  assert.equal(timers(), before);
+});
+
 test('a too_many_writes answer is tried again after its Retry-After with the same upload id (control: another refusal is not)', async () => {
   for (const code of ['too_many_writes', 'invalid_request']) {
     const server = new FakeServer();

@@ -26,6 +26,7 @@ export interface FamilyData {
   };
   death: Place & { cause: string; enemy?: string };
   damage: Place & { amount: number; source?: string };
+  position_sample: Place & { seconds: number };
   economy: Place & { direction: 'earn' | 'spend'; currency: string; amount: number; source?: string; sink?: string; item?: string };
   balance: { currency: string; amount: number };
   item: Place & { action: 'pickup' | 'use' | 'equip' | 'unequip' | 'drop' | 'craft' | 'buy' | 'sell'; item: string; count?: number };
