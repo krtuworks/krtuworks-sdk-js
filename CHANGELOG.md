@@ -4,6 +4,13 @@ All notable changes to `@krtuworks/sdk`. Versions follow semantic versioning; a 
 
 ## Unreleased
 
+## 1.0.12 - 2026-11-26
+
+### Fixed
+- A page brought back with the browser's back button (from the back-forward cache) opens a session again. Before, leaving the page ended its session and none opened on the way back, so later play and events had no session.
+- A level in play stays open while the page waits in the back-forward cache, so finishing it after coming back counts. Before, leaving the page told the level as quit and the later finish was lost. A page that goes for good still quits it.
+- A page loaded in a background tab counts no active time until it is shown, and the time a page waits in the back-forward cache is not counted. Before, both counted as play, in sessions, level times and position samples.
+
 ## 1.0.11 - 2026-11-26
 
 ### Added

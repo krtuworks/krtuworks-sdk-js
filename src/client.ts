@@ -907,6 +907,8 @@ export class Krtuworks {
 
   private watchPage(): void {
     if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    // A page opened in a background tab is not in use until it is shown.
+    this.sessions.setForeground(document.visibilityState === 'visible');
     const visibility = () => {
       const visible = document.visibilityState === 'visible';
       this.sessions.setForeground(visible);
@@ -915,11 +917,22 @@ export class Krtuworks {
         void this.files.flushWrites().catch(() => undefined);
       }
     };
-    const pagehide = () => {
-      this.levels.finish('quit');
+    // A page kept in the back-forward cache may come back mid-level: its attempt stays open (one never back is not
+    // told as a quit); a page that goes for good quits the level in play.
+    const pagehide = (event: PageTransitionEvent) => {
+      this.sessions.setForeground(false);
+      if (!event.persisted) this.levels.finish('quit');
       void this.events.persist().catch(() => undefined);
       void this.files.flushWrites().catch(() => undefined);
       void this.sessions.end();
+    };
+    // Back from the back-forward cache: the game goes on where it was, so a session opens again (pagehide ended the last one).
+    const pageshow = (event: PageTransitionEvent) => {
+      if (!event.persisted || this.stopped) return;
+      this.sessions.setForeground(document.visibilityState === 'visible');
+      if (this.identity.player && this.options.sessions && this.config.moduleOn('sessions')) void this.sessions.start();
+      void this.refreshConfig().catch(() => undefined);
+      void this.flush().catch(() => undefined);
     };
     const online = () => {
       this.events.resetBackoff();
@@ -931,10 +944,12 @@ export class Krtuworks {
     };
     document.addEventListener('visibilitychange', visibility);
     window.addEventListener('pagehide', pagehide);
+    window.addEventListener('pageshow', pageshow);
     window.addEventListener('online', online);
     this.detach.push(
       () => document.removeEventListener('visibilitychange', visibility),
       () => window.removeEventListener('pagehide', pagehide),
+      () => window.removeEventListener('pageshow', pageshow),
       () => window.removeEventListener('online', online),
     );
   }
