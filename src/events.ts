@@ -1,7 +1,7 @@
 import type { Api } from './api.js';
 import type { Clock } from './clock.js';
 import type { ResolvedOptions } from './config.js';
-import { KrtuworksError, isKrtuworksError } from './errors.js';
+import { KrtuworksError, WAITING_BACKOFF_MS, isKrtuworksError } from './errors.js';
 import { uuidV7 } from './ids.js';
 import { withLock } from './locks.js';
 import type { KrtuStore } from './store.js';
@@ -139,20 +139,29 @@ export class EventQueue {
     this.buffer = [];
     const byOwner = new Map<string, WireEvent[]>();
     for (const { owner, event } of taken) byOwner.set(owner, [...(byOwner.get(owner) ?? []), event]);
-    for (const [owner, events] of byOwner) {
-      await withLock(this.lock(owner), async () => {
-        const state = await this.load(owner);
-        state.pending.push(...events);
-        this.trim(state);
-        await this.save(owner, state);
-      });
+    const written = new Set<string>();
+    try {
+      for (const [owner, events] of byOwner) {
+        await withLock(this.lock(owner), async () => {
+          const state = await this.load(owner);
+          state.pending.push(...events);
+          this.trim(state);
+          await this.save(owner, state);
+        });
+        written.add(owner);
+      }
+    } catch (err) {
+      // A write the store refused (full, blocked) leaves the events in memory for the next try.
+      this.buffer = [...taken.filter((b) => !written.has(b.owner)), ...this.buffer];
+      throw err;
     }
   }
 
   private trim(state: QueueState): void {
-    const oldest = Date.now() - MAX_AGE_MS;
+    // An event's age is read on the server's clock: its own stamp is the device's, moved by the offset known when it was made (or now).
+    const oldest = this.ctx.clock.serverNow() - MAX_AGE_MS;
     const before = state.pending.length;
-    state.pending = state.pending.filter((e) => Date.parse(e.createdAt) >= oldest);
+    state.pending = state.pending.filter((e) => Date.parse(e.createdAt) + (e.serverOffsetMs ?? this.ctx.clock.serverOffsetMs ?? 0) >= oldest);
     let bytes = state.pending.reduce((n, e) => n + sizeOf(e), 0) + (state.batch?.events.reduce((n, e) => n + sizeOf(e), 0) ?? 0);
     let count = state.pending.length + (state.batch?.events.length ?? 0);
     let cut = 0;
@@ -346,6 +355,12 @@ export class EventQueue {
       await this.unfreeze(owner, batch);
       return 'done';
     }
+    if (err.authLayer || err.waiting) {
+      // Not a refusal of this batch (the credentials failed, or the refusal can lift): it stays, frozen, for later.
+      this.backoff(err);
+      return err.code;
+    }
+    if (err.code === 'account_deleted') return err.code;
     if (err.status === 400 || err.status === 413) {
       // The batch itself can never be taken: drop it rather than block every later event.
       await withLock(this.lock(owner), async () => {
@@ -363,8 +378,14 @@ export class EventQueue {
 
   private backoff(err: KrtuworksError): void {
     this.backoffMs = Math.min(300_000, Math.max(5_000, this.backoffMs * 2));
-    const wait = err.retryAfter !== null ? err.retryAfter * 1000 : this.backoffMs;
+    const wait = err.retryAfter !== null ? err.retryAfter * 1000 : err.waiting ? WAITING_BACKOFF_MS : this.backoffMs;
     this.notBefore = Date.now() + wait;
+  }
+
+  /** The account of `owner` is gone: what waits for it is dropped. */
+  async drop(owner: string): Promise<void> {
+    this.buffer = this.buffer.filter((b) => b.owner !== owner);
+    await withLock(this.lock(owner), () => this.ctx.store.delete(this.key(owner)));
   }
 
   /** Lets the next flush try at once (back online, or the player changed). */

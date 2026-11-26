@@ -173,6 +173,8 @@ export class Krtuworks {
   private sessionOwner: string | null = null;
   private readonly detach: Array<() => void> = [];
   private settling: Promise<void> = Promise.resolve();
+  private firstLaunchOffline = false;
+  private readonly startupListeners = new Set<(startup: 'ready' | 'first_launch_offline') => void>();
 
   private constructor(options: KrtuworksOptions) {
     this.options = resolveOptions(options);
@@ -210,7 +212,14 @@ export class Krtuworks {
     krtu.flushTimer = setInterval(() => void krtu.flush().catch(() => undefined), FLUSH_MS);
     krtu.configTimer = setInterval(() => void krtu.refreshConfig().catch(() => undefined), CONFIG_MS);
     for (const t of [krtu.flushTimer, krtu.configTimer]) (t as { unref?: () => void }).unref?.();
-    void krtu.refreshConfig().catch(() => undefined);
+    if (krtu.options.firstLaunch === 'online' && !krtu.identity.player && !krtu.config.value) {
+      // The very first launch: no player and no config ever kept. Whether the server can be reached is told before the game goes on.
+      await krtu.refreshConfig().catch((err: unknown) => {
+        if (err instanceof KrtuworksError && err.status === 0) krtu.setFirstLaunchOffline(true);
+      });
+    } else {
+      void krtu.refreshConfig().catch(() => undefined);
+    }
     krtu.settling = krtu.settle();
     return krtu;
   }
@@ -267,6 +276,8 @@ export class Krtuworks {
   }
 
   private identityChanged(change: IdentityChange): void {
+    if (change.type === 'merging') return;
+    if (change.type === 'signed_out' && change.reason === 'account_deleted' && change.subject) void this.dropOwner(change.subject).catch(() => undefined);
     if (change.type === 'merged' || change.type === 'signed_out' || change.type === 'deletion_pending' || change.type === 'sanctioned') {
       this.sessions.close();
       this.presence.forget();
@@ -287,6 +298,11 @@ export class Krtuworks {
     this.settling = this.settling.then(() => this.settle()).catch(() => undefined);
   }
 
+  /** The account of `subject` is gone: everything waiting for it on this device is dropped. */
+  private async dropOwner(subject: string): Promise<void> {
+    await Promise.all([this.events.drop(subject), this.progress.drop(subject), this.bugs.drop(subject), this.files.drop(subject)]);
+  }
+
   /**
    * What follows a player's arrival: the anonymous queues go to the first player; a merged account's
    * waiting queues move here once the server confirms the merge; the
@@ -305,7 +321,7 @@ export class Krtuworks {
     await this.settleMerges(player.subject).catch(() => undefined);
     await this.readOptOut().catch(() => undefined);
     await this.licences.ensureLoaded();
-    if (this.options.sessions && this.config.moduleOn('sessions')) await this.sessions.open().catch(() => undefined);
+    if (this.options.sessions && this.config.moduleOn('sessions')) await this.sessions.start();
     await this.refreshLicences();
     await this.refreshPresence();
     await this.files.resume().catch(() => undefined);
@@ -646,7 +662,40 @@ export class Krtuworks {
 
   async refreshConfig(): Promise<void> {
     await this.config.refresh();
+    this.setFirstLaunchOffline(false);
     await this.refreshPresence();
+  }
+
+  /**
+   * `first_launch_offline` while the app asks for a first online launch (`firstLaunch: "online"` in
+   * krtuworks-config.json) and this very first launch could not reach the server: the game shows "connect
+   * to play". It turns `ready` once the server answered. Without that setting it is always `ready`.
+   */
+  get startup(): 'ready' | 'first_launch_offline' {
+    return this.firstLaunchOffline ? 'first_launch_offline' : 'ready';
+  }
+
+  /** Called when `startup` changes. */
+  onStartupChange(listener: (startup: 'ready' | 'first_launch_offline') => void): () => void {
+    this.startupListeners.add(listener);
+    return () => this.startupListeners.delete(listener);
+  }
+
+  private setFirstLaunchOffline(value: boolean): void {
+    if (this.firstLaunchOffline === value) return;
+    this.firstLaunchOffline = value;
+    for (const listener of this.startupListeners) {
+      try {
+        listener(this.startup);
+      } catch {
+        // the app's listener
+      }
+    }
+  }
+
+  /** The server's clock now in milliseconds (the device clock moved by what the last answers said). */
+  serverNow(): number {
+    return this.clock.serverNow();
   }
 
   /** The owner's gates for this build: maintenance, a newer minimum version, a switch. */
@@ -795,6 +844,7 @@ export class Krtuworks {
   }
 
   private async send(): Promise<SendResult> {
+    this.sessions.ensure();
     await this.remindLinking('play_time').catch(() => undefined);
     const progress = await this.progress.flush();
     const blocked = this.config.switchForBuild()?.mode === 'ALL';
@@ -819,17 +869,23 @@ export class Krtuworks {
     const visibility = () => {
       const visible = document.visibilityState === 'visible';
       this.sessions.setForeground(visible);
-      if (!visible) void this.events.persist().catch(() => undefined);
+      if (!visible) {
+        void this.events.persist().catch(() => undefined);
+        void this.files.flushWrites().catch(() => undefined);
+      }
     };
     const pagehide = () => {
       this.levels.finish('quit');
       void this.events.persist().catch(() => undefined);
+      void this.files.flushWrites().catch(() => undefined);
       void this.sessions.end();
     };
     const online = () => {
       this.events.resetBackoff();
       this.progress.resetBackoff();
       this.bugs.resetBackoff();
+      this.sessions.ensure(true);
+      void this.refreshConfig().catch(() => undefined);
       void this.flush().catch(() => undefined);
     };
     document.addEventListener('visibilitychange', visibility);
@@ -853,6 +909,7 @@ export class Krtuworks {
     if (this.flushSoon) clearTimeout(this.flushSoon);
     for (const off of this.detach.splice(0)) off();
     this.levels.finish('quit');
+    await this.files.flushWrites().catch(() => undefined);
     await this.events.persist();
     await this.sessions.end();
   }

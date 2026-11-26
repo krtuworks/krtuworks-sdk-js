@@ -13,6 +13,8 @@ export interface KrtuworksAppConfig {
   slug: string;
   /** The game-only parts (levels, deaths) stay off in the other kinds. A file made before the field existed is a game's. */
   type?: AppType;
+  /** `online`: the very first launch needs the server (see `Krtuworks.startup`); default `offline`: the game starts without it. */
+  firstLaunch?: 'online' | 'offline';
   environments: Partial<Record<Environment, { clientId?: string; webClientId?: string }>>;
 }
 
@@ -65,7 +67,7 @@ export const CURRENT_TERMS = 'TERMS:v1 PRIVACY:v1';
 /** The SDK modules the owner switches per app (`config.modules`); a module that is off makes nothing. */
 export const MODULES = [
   'sessions', 'progression', 'combat', 'economy', 'items', 'ui', 'performance', 'settings', 'errors',
-  'bugReports', 'achievements', 'stats', 'cloudSave', 'remoteConfig', 'abTests', 'customEvents', 'presence',
+  'bugReports', 'achievements', 'stats', 'cloudSave', 'remoteConfig', 'abTests', 'customEvents', 'leaderboards', 'presence',
 ] as const;
 export type Module = (typeof MODULES)[number];
 
@@ -98,6 +100,7 @@ export interface ResolvedOptions {
   type: AppType;
   /** The app is a game (type GAME): levels and deaths are kept. */
   game: boolean;
+  firstLaunch: 'online' | 'offline';
   environment: Environment;
   platform: Platform;
   build: string;
@@ -126,6 +129,7 @@ export function resolveOptions(options: KrtuworksOptions): ResolvedOptions {
     slug: config.slug,
     type,
     game: type === 'GAME',
+    firstLaunch: config.firstLaunch === 'online' ? 'online' : 'offline',
     environment,
     platform: options.platform,
     build: options.build,

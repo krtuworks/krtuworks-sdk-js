@@ -74,6 +74,23 @@ export interface SaveOptions {
 }
 
 const POLL_LIMIT_MS = 60_000;
+/** A settings slot takes one write this often; newer content replaces the one waiting for its turn. */
+const SETTINGS_WRITE_MS = 30_000;
+/** The wait before another try when the server answered `too_many_writes` without a Retry-After (its limit is 10 s per slot). */
+const WRITE_RETRY_MS = 10_000;
+
+/** A settings-like save held for its turn: only the newest of a lane waits, the older ones end with `save_replaced`. */
+interface HeldWrite {
+  upload: PendingUpload;
+  resolve: (version: FileVersion) => void;
+  reject: (err: unknown) => void;
+}
+
+interface LaneWrites {
+  timer: ReturnType<typeof setTimeout> | null;
+  held: HeldWrite | null;
+  lastAt: number;
+}
 
 const replaced = (): KrtuworksError => new KrtuworksError('save_replaced', 'A newer save of this slot took the place of this one before it was sent.', 409);
 
@@ -87,6 +104,8 @@ export class Files {
   private readonly revisions = new Map<string, number>();
   /** Orders the saves started in one millisecond. */
   private seq = 0;
+  /** Per lane: when a settings write last went out and the one waiting for its turn. */
+  private readonly writes = new Map<string, LaneWrites>();
 
   constructor(
     private readonly opts: ResolvedOptions,
@@ -96,6 +115,8 @@ export class Files {
     private readonly generation: () => number,
     /** Told after every save the server activated (the client's link reminder counts the first one). */
     private readonly onSaved: () => void = () => undefined,
+    /** How often a settings slot takes a write (a test sets it shorter). */
+    private readonly settingsWriteMs: number = SETTINGS_WRITE_MS,
   ) {}
 
   private revisionKey(slot: string, device?: string | null): string {
@@ -210,7 +231,81 @@ export class Files {
       v: 2,
     };
     await this.store.set(this.uploadKey(upload.uploadId), upload);
-    return this.pump(upload, () => undefined);
+    if (!upload.conditional) return this.paced(upload);
+    return this.writeNow(upload);
+  }
+
+  /** Sends a save at once; a `too_many_writes` answer is tried again after its Retry-After. */
+  private async writeNow(upload: PendingUpload): Promise<FileVersion> {
+    try {
+      return await this.pump(upload, () => undefined);
+    } catch (err) {
+      if (isKrtuworksError(err, 'too_many_writes')) this.retryLater(upload, err.retryAfter, null);
+      throw err;
+    }
+  }
+
+  /**
+   * Tries `upload` again after a `too_many_writes` answer (the save stays on the device meanwhile). `held`
+   * is the caller still waiting for it, who hears how it ended.
+   */
+  private retryLater(upload: PendingUpload, retryAfter: number | null, held: HeldWrite | null): void {
+    const timer = setTimeout(
+      () => {
+        this.pump(upload, () => undefined).then(
+          (version) => held?.resolve(version),
+          (err: unknown) => {
+            if (isKrtuworksError(err, 'too_many_writes')) this.retryLater(upload, err.retryAfter, held);
+            else held?.reject(err);
+          },
+        );
+      },
+      Math.max(1000, (retryAfter ?? WRITE_RETRY_MS / 1000) * 1000),
+    );
+    (timer as { unref?: () => void }).unref?.();
+  }
+
+  /**
+   * A settings-like save (no base: SETTINGS, DEVICE_SETTINGS) goes out at most once every
+   * `SETTINGS_WRITE_MS` per lane, the newest content winning; it is on the device from the moment it is made.
+   * `flushWrites` sends what waits at once.
+   */
+  private paced(upload: PendingUpload): Promise<FileVersion> {
+    const lane = this.laneLock(upload);
+    const writes = this.writes.get(lane) ?? { timer: null, held: null, lastAt: 0 };
+    this.writes.set(lane, writes);
+    return new Promise<FileVersion>((resolve, reject) => {
+      const older = writes.held;
+      writes.held = { upload, resolve, reject };
+      if (older) void this.forget(older.upload.uploadId).then(() => older.reject(replaced()));
+      const wait = writes.lastAt + this.settingsWriteMs - Date.now();
+      if (wait <= 0) void this.release(lane);
+      else if (!writes.timer) {
+        writes.timer = setTimeout(() => void this.release(lane), wait);
+        (writes.timer as { unref?: () => void }).unref?.();
+      }
+    });
+  }
+
+  private async release(lane: string): Promise<void> {
+    const writes = this.writes.get(lane);
+    const held = writes?.held;
+    if (!writes || !held) return;
+    if (writes.timer) clearTimeout(writes.timer);
+    writes.timer = null;
+    writes.held = null;
+    writes.lastAt = Date.now();
+    try {
+      held.resolve(await this.pump(held.upload, () => undefined));
+    } catch (err) {
+      if (isKrtuworksError(err, 'too_many_writes')) this.retryLater(held.upload, err.retryAfter, held);
+      else held.reject(err);
+    }
+  }
+
+  /** Sends the settings saves waiting for their turn now (the app pauses or ends). */
+  async flushWrites(): Promise<void> {
+    await Promise.all([...this.writes.keys()].map((lane) => this.release(lane)));
   }
 
   /**
@@ -267,7 +362,7 @@ export class Files {
         await this.send(upload);
         return { outcome: 'saved' };
       } catch (sent) {
-        if (isKrtuworksError(sent) && !sent.retryable && sent.code !== 'upload_pending') return { outcome: 'refused', code: sent.code };
+        if (isKrtuworksError(sent) && !sent.keepsQueued && sent.code !== 'upload_pending') return { outcome: 'refused', code: sent.code };
         throw sent;
       }
     }
@@ -313,7 +408,9 @@ export class Files {
         owner: upload.owner,
       });
     } catch (err) {
-      if (isKrtuworksError(err) && !err.retryable) await this.forget(upload.uploadId);
+      // Only a refusal of the save itself (or a gone account) lets it go; a retry, a waiting refusal
+      // (a merge, a ban, a switch) or a credentials failure keeps it on the device.
+      if (isKrtuworksError(err) && !err.keepsQueued) await this.forget(upload.uploadId);
       throw err;
     }
     if (answer.status === 201) return this.done(upload, (answer.json?.file as FileVersion) ?? null);
@@ -331,7 +428,11 @@ export class Files {
       if (status === 'ACTIVATED') return this.done(upload, null, current?.file as { id: string } | null);
       if (status === 'REJECTED') {
         await this.forget(upload.uploadId);
-        throw new KrtuworksError(String(current?.code ?? 'write_failed'), 'The save was refused.', 409, null, { upload: current });
+        const code = String(current?.code ?? 'write_failed');
+        const details: Record<string, unknown> = { upload: current };
+        // The chooser needs the version now in the slot, which the upload's record does not carry.
+        if (code === 'file_conflict') details.current = await this.currentOf(upload).catch(() => undefined);
+        throw new KrtuworksError(code, 'The save was refused.', 409, null, details);
       }
       if (Date.now() - started > POLL_LIMIT_MS) {
         throw new KrtuworksError('upload_pending', 'The save is still being written; it is finished on a later launch.', 202, null, { uploadId: upload.uploadId });
@@ -343,6 +444,13 @@ export class Files {
       const answer = await this.api.player(`${this.path(upload.slot)}/uploads/${upload.uploadId}`, { owner: upload.owner });
       current = answer.json;
     }
+  }
+
+  /** The version now in `upload`'s slot (for its device in a DEVICE_SETTINGS slot), or undefined. */
+  private async currentOf(upload: PendingUpload): Promise<FileVersion | undefined> {
+    const slot = (await this.listFor(upload.owner)).slots.find((s) => s.key === upload.slot);
+    if (upload.device) return slot?.devices.find((v) => v.device === upload.device) ?? undefined;
+    return slot?.file ?? undefined;
   }
 
   private async done(upload: PendingUpload, file: FileVersion | null, ref?: { id: string } | null): Promise<FileVersion> {
@@ -388,7 +496,7 @@ export class Files {
         tell(upload, 'saved');
       } catch (err) {
         const code = isKrtuworksError(err) ? err.code : 'error';
-        tell(upload, code === 'save_replaced' ? 'replaced' : code === 'upload_pending' || (isKrtuworksError(err) && err.retryable) ? 'waiting' : 'refused', code);
+        tell(upload, code === 'save_replaced' ? 'replaced' : code === 'upload_pending' || (isKrtuworksError(err) && err.keepsQueued) ? 'waiting' : 'refused', code);
       }
     }
     return out;
@@ -414,6 +522,20 @@ export class Files {
     const saved = await this.save(waiting.slot, waiting.bytes, { base, device: waiting.device ?? undefined, deviceInfo: waiting.deviceInfo ?? undefined });
     await this.forget(uploadId);
     return saved;
+  }
+
+  /** The account of `owner` is gone: the saves waiting for it are dropped. */
+  async drop(owner: string): Promise<void> {
+    for (const key of await this.store.keys(`krtu:${this.opts.clientId}:upload:`)) {
+      const upload = await this.store.get<PendingUpload>(key);
+      if (upload?.owner !== owner) continue;
+      await this.forget(upload.uploadId);
+      const writes = this.writes.get(this.laneLock(upload));
+      if (writes?.held?.upload.uploadId === upload.uploadId) {
+        writes.held.reject(new KrtuworksError('account_deleted', 'The account was deleted; the save was dropped.', 401));
+        writes.held = null;
+      }
+    }
   }
 
   /** A waiting save the player chose not to keep. */

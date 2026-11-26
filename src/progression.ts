@@ -1,4 +1,5 @@
 import type { FamilyData } from './families.js';
+import { ANON } from './events.js';
 import type { KrtuStore } from './store.js';
 
 export interface LevelRef {
@@ -8,6 +9,8 @@ export interface LevelRef {
 }
 
 interface Attempt extends LevelRef {
+  /** The player the attempt belongs to. */
+  owner: string;
   attempt: number;
   startedAt: number;
   activeAtStart: number;
@@ -33,8 +36,17 @@ export class ProgressionTracker {
     private readonly emit: (data: ProgressionEvent) => void,
   ) {}
 
-  private key(): string {
-    return `krtu:${this.clientId}:levels:${this.owner()}`;
+  /** The attempt in play, when it is the present player's: another player's is dropped without a word (nothing is told under the new owner). */
+  private live(): Attempt | null {
+    const owner = this.owner();
+    // Before any player there is only the anonymous one: its level goes on to the first player, like its events.
+    if (this.current?.owner === ANON) this.current.owner = owner;
+    if (this.current && this.current.owner !== owner) this.current = null;
+    return this.current;
+  }
+
+  private key(owner: string): string {
+    return `krtu:${this.clientId}:levels:${owner}`;
   }
 
   private ref(level: LevelRef): string {
@@ -55,32 +67,34 @@ export class ProgressionTracker {
   }
 
   async start(level: LevelRef): Promise<void> {
-    if (this.current) this.finish('quit');
-    const counts = (await this.store.get<Record<string, number>>(this.key())) ?? {};
+    if (this.live()) this.finish('quit');
+    const owner = this.owner();
+    const counts = (await this.store.get<Record<string, number>>(this.key(owner))) ?? {};
     const ref = this.ref(level);
     counts[ref] = (counts[ref] ?? 0) + 1;
-    await this.store.set(this.key(), counts);
-    this.current = { ...level, attempt: counts[ref]!, startedAt: Date.now(), activeAtStart: this.activeSeconds(), deaths: 0 };
+    await this.store.set(this.key(owner), counts);
+    if (this.owner() !== owner) return;
+    this.current = { ...level, owner, attempt: counts[ref]!, startedAt: Date.now(), activeAtStart: this.activeSeconds(), deaths: 0 };
     this.emit({ action: 'start', ...this.place(level), attempt: this.current.attempt });
   }
 
   /** Ends the attempt in play (complete, fail or quit). */
   finish(action: 'complete' | 'fail' | 'quit', extra: { score?: number } = {}): void {
-    const a = this.current;
+    const a = this.live();
     if (!a) return;
     this.current = null;
     this.emit({ action, ...this.place(a), ...this.times(a), ...(extra.score !== undefined ? { score: extra.score } : {}) });
   }
 
   checkpoint(name: string): void {
-    const a = this.current;
+    const a = this.live();
     if (!a) return;
     this.emit({ action: 'checkpoint', ...this.place(a), checkpoint: name, ...this.times(a) });
   }
 
   /** The level starts over: the attempt in play ends as a restart and a new one begins. */
   async restart(): Promise<void> {
-    const a = this.current;
+    const a = this.live();
     if (!a) return;
     this.current = null;
     this.emit({ action: 'restart', ...this.place(a), ...this.times(a) });
@@ -89,12 +103,14 @@ export class ProgressionTracker {
 
   /** A death counts toward the attempt in play. */
   noteDeath(): LevelRef | null {
-    if (!this.current) return null;
-    this.current.deaths += 1;
-    return { level: this.current.level, world: this.current.world, part: this.current.part };
+    const a = this.live();
+    if (!a) return null;
+    a.deaths += 1;
+    return { level: a.level, world: a.world, part: a.part };
   }
 
   get inPlay(): LevelRef | null {
-    return this.current ? { level: this.current.level, world: this.current.world, part: this.current.part } : null;
+    const a = this.live();
+    return a ? { level: a.level, world: a.world, part: a.part } : null;
   }
 }

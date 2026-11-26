@@ -1,6 +1,6 @@
 import type { Api } from './api.js';
 import type { ResolvedOptions } from './config.js';
-import { KrtuworksError, isKrtuworksError } from './errors.js';
+import { KrtuworksError, WAITING_BACKOFF_MS, isKrtuworksError } from './errors.js';
 import { base64, uuidV7 } from './ids.js';
 import { withLock } from './locks.js';
 import type { KrtuStore } from './store.js';
@@ -55,6 +55,8 @@ export interface ProgressRefusal {
 const KEY = /^[a-z][a-z0-9_.]{0,63}$/;
 const MAX_VALUE = 1e15;
 const MAX_OPS = 100;
+/** How many refusals are kept for the game's diagnostics (the newest). */
+const MAX_REFUSALS = 100;
 /** Refusals that say the stat or achievement itself is gone: what waits for it goes too. */
 const KEY_GONE = new Set(['unknown_stat', 'stat_retired', 'unknown_achievement', 'achievement_retired']);
 
@@ -381,6 +383,7 @@ export class ProgressQueue {
           count += 1;
           if (r.status === 'rejected') {
             this.refusals.push({ type, key, code: r.code ?? 'rejected' });
+            if (this.refusals.length > MAX_REFUSALS) this.refusals.shift();
             if (type === 'score' ? BOARD_GONE.has(r.code ?? '') : KEY_GONE.has(r.code ?? '')) {
               if (type === 'unlock') delete state.unlocks[key];
               else if (type === 'score') delete state.scores[key];
@@ -403,9 +406,14 @@ export class ProgressQueue {
     return out;
   }
 
+  /** The account of `owner` is gone: what waits for it is dropped. */
+  async drop(owner: string): Promise<void> {
+    await withLock(this.key(owner), () => this.ctx.store.delete(this.key(owner)));
+  }
+
   private backoff(err: KrtuworksError): void {
     this.backoffMs = Math.min(300_000, Math.max(5_000, this.backoffMs * 2));
-    this.notBefore = Date.now() + (err.retryAfter !== null ? err.retryAfter * 1000 : this.backoffMs);
+    this.notBefore = Date.now() + (err.retryAfter !== null ? err.retryAfter * 1000 : err.waiting ? WAITING_BACKOFF_MS : this.backoffMs);
   }
 
   resetBackoff(): void {

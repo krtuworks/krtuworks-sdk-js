@@ -1,4 +1,5 @@
 import type { Api } from './api.js';
+import { KrtuworksError } from './errors.js';
 import { GAME_MODULES, MODULES, type Module, type ResolvedOptions } from './config.js';
 import type { KrtuStore } from './store.js';
 
@@ -62,7 +63,11 @@ export class RemoteConfig {
       accept: [304],
     });
     if (answer.status === 304) return false;
-    this.stored = { etag: answer.headers.get('etag'), value: answer.json as unknown as RemoteConfigValue };
+    const body = answer.json;
+    if (!body || Array.isArray(body) || typeof body.config !== 'object' || body.config === null) {
+      throw new KrtuworksError('invalid_response', 'The config answer is not a config; the kept copy stays.', answer.status);
+    }
+    this.stored = { etag: answer.headers.get('etag'), value: body as unknown as RemoteConfigValue };
     await this.store.set(this.key, this.stored);
     return true;
   }

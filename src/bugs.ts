@@ -1,6 +1,6 @@
 import type { Api } from './api.js';
 import type { ResolvedOptions } from './config.js';
-import { KrtuworksError, isKrtuworksError } from './errors.js';
+import { KrtuworksError, WAITING_BACKOFF_MS, isKrtuworksError } from './errors.js';
 import type { EventPosition, WireEvent } from './events.js';
 import { uuidV4 } from './ids.js';
 import type { KrtuStore } from './store.js';
@@ -77,6 +77,8 @@ const REPORT_REFUSED = new Set([400, 413]);
 const REPORT_REFUSED_CODES = new Set(['report_id_reused']);
 /** The screenshot can never be taken (too late, too big, not a picture, the report gone); `screenshot_exists` is done. */
 const SCREENSHOT_REFUSED = new Set([400, 404, 409, 411, 413, 415]);
+/** 409 answers that pass: the screenshot waits and is sent again. */
+const SCREENSHOT_TRANSIENT_CODES = new Set(['app_transferring', 'account_merging']);
 const TOLD_KEPT = 200;
 
 /** The picture's type from its first bytes (what the server takes). */
@@ -264,6 +266,8 @@ export class BugReports {
     const queue = (await Promise.all(keys.map(async (k) => ({ key: k, w: await this.store.get<Waiting>(k) }))))
       .filter((e): e is { key: string; w: Waiting } => !!e.w)
       .sort((a, b) => a.w.madeAt - b.w.madeAt);
+    const waitingIds = new Set(queue.map((e) => e.w.reportId));
+    for (const id of this.waitUntil.keys()) if (!waitingIds.has(id)) this.waitUntil.delete(id);
     for (const { key, w } of queue) {
       if ((this.waitUntil.get(w.reportId) ?? 0) > now) continue;
       try {
@@ -284,7 +288,7 @@ export class BugReports {
             });
           } catch (err) {
             // The report is in: a screenshot it already has is done, one refused for good is let go.
-            if (!isKrtuworksError(err) || !SCREENSHOT_REFUSED.has(err.status)) throw err;
+            if (!isKrtuworksError(err) || err.authLayer || err.keepsQueued || SCREENSHOT_TRANSIENT_CODES.has(err.code) || !SCREENSHOT_REFUSED.has(err.status)) throw err;
             if (err.code !== 'screenshot_exists') result.dropped.push({ reportId: w.reportId, code: err.code, screenshotOnly: true });
           }
         }
@@ -293,18 +297,24 @@ export class BugReports {
         result.sent += 1;
       } catch (err) {
         const e = isKrtuworksError(err) ? err : new KrtuworksError('network_error', String(err));
-        if (!w.bugId && (REPORT_REFUSED.has(e.status) || REPORT_REFUSED_CODES.has(e.code))) {
+        if (!e.authLayer && !w.bugId && (REPORT_REFUSED.has(e.status) || REPORT_REFUSED_CODES.has(e.code))) {
           await this.store.delete(key);
           result.dropped.push({ reportId: w.reportId, code: e.code, screenshotOnly: false });
           continue;
         }
         // Anything else (no answer, a busy or closed server, a player in a merge, a ban, the module
         // off for now) keeps the report for later.
-        if (e.code !== 'context_changed') this.waitUntil.set(w.reportId, now + (e.retryAfter !== null ? e.retryAfter * 1000 : RETRY_MS));
+        if (e.code !== 'context_changed') this.waitUntil.set(w.reportId, now + (e.retryAfter !== null ? e.retryAfter * 1000 : e.waiting ? WAITING_BACKOFF_MS : RETRY_MS));
         return { ...result, stoppedBy: e.code };
       }
     }
     return result;
+  }
+
+  /** The account of `owner` is gone: its waiting reports and screenshots are dropped. */
+  async drop(owner: string): Promise<void> {
+    for (const key of await this.store.keys(this.prefix(owner))) await this.store.delete(key);
+    await this.store.delete(this.fixedKey(owner));
   }
 
   /** The player's reports in this app and environment, newest first; fixes not told yet are told. */

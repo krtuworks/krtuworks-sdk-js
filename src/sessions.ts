@@ -1,6 +1,6 @@
 import type { Api } from './api.js';
 import type { ResolvedOptions } from './config.js';
-import { KrtuworksError, isKrtuworksError } from './errors.js';
+import { KrtuworksError, WAITING_BACKOFF_MS, isKrtuworksError } from './errors.js';
 import { uuidV4 } from './ids.js';
 
 export interface SessionInfo {
@@ -25,6 +25,12 @@ export class SessionKeeper {
   /** The launch's time in use when the current session began: the server counts only what follows. */
   private sessionBaseMs = 0;
   private opening: Promise<SessionInfo | null> | null = null;
+  /** The player the open in flight is for. */
+  private openingFor: string | null = null;
+  /** The app wants a session (`start` ran): a failed open is tried again until one is open or `close`. */
+  private wanted = false;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryMs = 0;
 
   constructor(
     private readonly opts: ResolvedOptions,
@@ -68,16 +74,63 @@ export class SessionKeeper {
   /** Opens the player's session if there is none (one at a time). */
   async open(): Promise<SessionInfo | null> {
     if (this.session) return this.session;
+    if (this.opening && this.openingFor !== this.subject()) {
+      // The open in flight is another player's: its answer is not this player's session.
+      await this.opening.catch(() => undefined);
+      return this.open();
+    }
+    this.openingFor = this.subject();
     this.opening ??= this.doOpen().finally(() => {
       this.opening = null;
     });
     return this.opening;
   }
 
+  /**
+   * Opens the session and keeps trying: a launch that is offline, a busy server or a refusal that can lift
+   * leaves no session for the whole run otherwise. A failed open is tried again with a growing wait (the
+   * server's Retry-After first), at the next `ensure` (a flush, the browser coming back online) and until `close`.
+   */
+  async start(): Promise<SessionInfo | null> {
+    this.wanted = true;
+    this.cancelRetry();
+    try {
+      const session = await this.open();
+      if (session) this.retryMs = 0;
+      return session;
+    } catch (err) {
+      this.scheduleRetry(isKrtuworksError(err) ? err : null);
+      return null;
+    }
+  }
+
+  /** Tries a failed open again now when none is waiting for its time (a flush, the page back online). */
+  ensure(force = false): void {
+    if (!this.wanted || this.session || this.opening || !this.subject()) return;
+    if (this.retryTimer && !force) return;
+    void this.start();
+  }
+
+  private scheduleRetry(err: KrtuworksError | null): void {
+    if (!this.wanted || this.retryTimer) return;
+    this.retryMs = Math.min(300_000, Math.max(15_000, this.retryMs * 2));
+    const wait = err?.retryAfter != null ? err.retryAfter * 1000 : err?.waiting ? WAITING_BACKOFF_MS : this.retryMs;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.ensure();
+    }, wait);
+    (this.retryTimer as { unref?: () => void }).unref?.();
+  }
+
+  private cancelRetry(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
   private async doOpen(): Promise<SessionInfo | null> {
     const owner = this.subject();
     if (!owner) return null;
-    if (this.current && this.current.owner !== owner) this.close();
+    if (this.current && this.current.owner !== owner) this.reset();
     if (!this.clientSessionId) {
       // A new session (not an open sent again after a lost answer): its time in use starts now.
       this.clientSessionId = uuidV4();
@@ -126,7 +179,7 @@ export class SessionKeeper {
         // The server closed it (30 minutes without a heartbeat): a new one, with a new id.
         this.current = null;
         this.clientSessionId = null;
-        await this.open().catch(() => undefined);
+        await this.start();
         return;
       }
     } finally {
@@ -170,6 +223,13 @@ export class SessionKeeper {
 
   /** Forgets the session without telling the server (the player changed: it times out there). */
   close(): void {
+    this.reset();
+    this.wanted = false;
+    this.retryMs = 0;
+    this.cancelRetry();
+  }
+
+  private reset(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.current = null;

@@ -50,7 +50,7 @@ export class Api {
    * A player's call, for `call.owner` (or whoever plays now). Every attempt sends only with a token of that
    * player: when the token in hand is another one's (the player changed while it was fetched, or before
    * the retry after a 401), nothing is sent (`context_changed`). An expired or revoked token is refreshed
-   * once and the call made again; a merged account is reported to the identity; an answer that arrives
+   * once and the call made again; a merged or deleted account is reported to the identity; an answer that arrives
    * after the player changed is dropped too, so it can never land in another player's state.
    */
   async player(path: string, call: PlayerCall = {}): Promise<Answer> {
@@ -61,15 +61,26 @@ export class Api {
     if (answer.status === 401) {
       const err = errorOf(answer);
       if (err.code === 'account_merged') await this.identity.markMerged(owner, typeof err.details.mergedInto === 'string' ? err.details.mergedInto : null);
+      if (err.code === 'account_deleted') await this.identity.markDeleted(owner);
       if (err.code === 'token_expired' || err.code === 'token_revoked' || err.code === 'invalid_token') answer = await this.attempt(path, call, true, owner);
     }
     if (this.identity.generation !== generation) throw contextChanged();
+    if (answer.status === 409 && errorOf(answer).code === 'account_merging') this.identity.noteMerging(true);
+    else if (answer.status >= 200 && answer.status < 300) this.identity.noteMerging(false);
     if ((answer.status >= 300 || answer.status < 200) && !call.accept?.includes(answer.status)) throw errorOf(answer);
     return answer;
   }
 
   private async attempt(path: string, call: PlayerCall, forceRefresh: boolean, owner: string): Promise<Answer> {
-    const { accessToken: token, subject } = await this.identity.credentials(forceRefresh);
+    let credentials: { accessToken: string; subject: string };
+    try {
+      credentials = await this.identity.credentials(forceRefresh);
+    } catch (err) {
+      // Raised before the call's own request: a queue must not read it as a refusal of its body.
+      if (err instanceof KrtuworksError) err.authLayer = true;
+      throw err;
+    }
+    const { accessToken: token, subject } = credentials;
     if (subject !== owner) throw contextChanged();
     const headers: Record<string, string> = { authorization: `Bearer ${token}`, 'x-krtu-build': this.opts.build, ...call.headers };
     let body: BodyInit | undefined = call.body;

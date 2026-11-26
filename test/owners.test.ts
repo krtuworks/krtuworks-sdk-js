@@ -72,7 +72,7 @@ async function rig(server: FakeServer, store: KrtuStore = memoryStore(), fetchFn
     store,
     progress: new ProgressQueue({ opts, store, api, subject }),
     events: new EventQueue({ opts, store, clock, api, subject }),
-    files: new Files(opts, api, store, subject, () => identity.generation),
+    files: new Files(opts, api, store, subject, () => identity.generation, () => undefined, 0),
   };
 }
 
@@ -346,12 +346,14 @@ test('a save started while an earlier one of the slot is in flight is replaced b
   let release!: () => void;
   const held = new Promise<void>((r) => (release = r));
   const put = server['routes'].get('PUT /v1/apps/buried/files/settings')!;
+  let reached = false;
   server.on('PUT', '/v1/apps/buried/files/settings', async (call) => {
+    reached = true;
     if (!taken.length) await held;
     return put(call);
   });
   const first = files.save('settings', new TextEncoder().encode('v1'));
-  await new Promise((r) => setTimeout(r, 10));
+  while (!reached) await new Promise((r) => setTimeout(r, 5));
   const second = files.save('settings', new TextEncoder().encode('v2'));
   const third = files.save('settings', new TextEncoder().encode('v3'));
   while ((await store.keys(UPLOADS)).length < 3) await new Promise((r) => setTimeout(r, 5));

@@ -231,7 +231,8 @@ export async function validate(options: ValidateOptions): Promise<ValidationRepo
         // An older save of this slot left by another run is replaced by this one; only this one's outcome counts.
         const resent = (await k.files.resume()).filter((u) => u.slot === slot.key && u.outcome !== 'replaced');
         const refused = resent.find((u) => u.outcome !== 'saved');
-        if (refused || !resent.length) return check('cloud_save', 'FAILED', refused?.code ?? 'not sent');
+        // The SDK may have sent it again by itself meanwhile; the read back below shows whether it landed.
+        if (refused) return check('cloud_save', 'FAILED', refused.code);
       }
       const back = await k.files.read(slot.key);
       const same = !!back && back.bytes.length === bytes.length && back.bytes.every((b, i) => b === bytes[i]);

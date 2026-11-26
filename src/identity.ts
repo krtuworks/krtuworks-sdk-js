@@ -1,7 +1,7 @@
 import type { Clock } from './clock.js';
 import { CURRENT_TERMS, DEV_RESOURCE, GUEST_SCOPE, PLAYER_SCOPE, type ResolvedOptions } from './config.js';
 import { createDeviceKey, signProof, type DeviceKey, type ProofPurpose } from './deviceKey.js';
-import { KrtuworksError } from './errors.js';
+import { KrtuworksError, isKrtuworksError } from './errors.js';
 import { base64Url, randomToken, sha256 } from './ids.js';
 import { jwtClaims } from './jwt.js';
 import { withLock } from './locks.js';
@@ -51,9 +51,12 @@ interface PendingSignIn {
 export type IdentityChange =
   | { type: 'signed_in'; player: Player; promoted: boolean }
   | { type: 'guest'; player: Player; created: boolean }
-  | { type: 'signed_out'; reason: string }
+  /** `subject`: whose account is gone, with reason `account_deleted`. */
+  | { type: 'signed_out'; reason: string; subject?: string }
   | { type: 'merged'; previousSubject: string; mergedInto: string | null }
   | { type: 'deletion_pending' }
+  /** The server answered `account_merging`: told once when the merge is seen (`started`) and once when calls go through again (`ended`). */
+  | { type: 'merging'; state: 'started' | 'ended' }
   | { type: 'sanctioned'; reason: string | null };
 
 export interface IdentityContext {
@@ -66,6 +69,8 @@ export interface IdentityContext {
 export const DEVICE_KEY_GRANT = 'urn:krtuworks:params:oauth:grant-type:device-key';
 const PENDING_TTL_MS = 10 * 60_000;
 const REFRESH_EARLY_MS = 60_000;
+/** Guest answers no retry changes: the age screen's answers were refused for good. */
+const PERMANENT_GUEST_REFUSALS: ReadonlySet<string> = new Set(['too_young', 'invalid_birth_date']);
 
 function signedOut(): KrtuworksError {
   return new KrtuworksError('signed_out', 'No player is signed in.');
@@ -88,6 +93,7 @@ export class Identity {
   private readonly listeners = new Set<(change: IdentityChange) => void>();
   /** Bumped whenever the signed-in player changes; an answer made for another one is dropped. */
   generation = 0;
+  private merging = false;
 
   constructor(private readonly ctx: IdentityContext) {}
 
@@ -224,7 +230,10 @@ export class Identity {
     return withLock(this.lockName, async () => {
       const stored = (await this.ctx.store.get<StoredTokens>(this.key('tokens'))) ?? null;
       if (!stored) {
+        // Another tab signed out: this tab follows it, and the app hears it as it would from its own sign-out.
+        const hadPlayer = this.tokens !== null;
         await this.adopt(null);
+        if (hadPlayer) this.emit({ type: 'signed_out', reason: 'signed_out' });
         throw signedOut();
       }
       if (stored.accessToken !== usedAccess && stored.accessExpiresAt - REFRESH_EARLY_MS > this.ctx.clock.serverNow()) {
@@ -287,9 +296,30 @@ export class Identity {
     throw new KrtuworksError('account_merged', 'This account was merged into another one; sign in with it.', 401, null, { mergedInto });
   }
 
+  /** Tells the app once per episode that the account is being merged, and once when it is over. */
+  noteMerging(on: boolean): void {
+    if (this.merging === on) return;
+    this.merging = on;
+    this.emit({ type: 'merging', state: on ? 'started' : 'ended' });
+  }
+
   /** The server said a player's account went into another one (401 account_merged on that player's call). */
   async markMerged(previousSubject: string, mergedInto: string | null): Promise<never> {
     return withLock(this.lockName, () => this.markMergedLocked(previousSubject, mergedInto));
+  }
+
+  /**
+   * The server said a player's account is deleted (401 account_deleted on that player's call). When that
+   * player is still the signed-in one, its tokens go and the app is told, with the subject so the
+   * queues made for it are dropped.
+   */
+  async markDeleted(subject: string): Promise<void> {
+    await withLock(this.lockName, async () => {
+      const stored = (await this.ctx.store.get<StoredTokens>(this.key('tokens'))) ?? null;
+      if (stored?.subject !== subject) return;
+      await this.adopt(null);
+      this.emit({ type: 'signed_out', reason: 'account_deleted', subject });
+    });
   }
 
   // ── Guests (device key) ──────────────────────────────────────────────────
@@ -374,25 +404,38 @@ export class Identity {
    * guest is then not used.
    */
   async signInAsGuest(input: { birthDate?: string; acceptedTerms?: string } = {}): Promise<Player> {
-    const meta = await this.meta();
-    const epoch = meta.epoch;
-    if (input.birthDate) {
-      meta.guestRequest = { birthDate: input.birthDate, acceptedTerms: input.acceptedTerms ?? CURRENT_TERMS };
-      await this.saveMeta(meta);
-    }
+    const epoch = (await this.meta()).epoch;
     const result = await withLock(this.lockName, async () => {
       const current = (await this.ctx.store.get<StoredTokens>(this.key('tokens'))) ?? null;
       if (current) {
         await this.adopt(current);
         return { player: this.player!, created: false, fresh: false };
       }
-      const { tokens, created } = await this.deviceKeyGrant((await this.meta()).guestRequest);
+      const before = await this.meta();
+      // Terms alone update a request already kept (the terms moved); with no date of birth there is nothing to ask with.
+      const kept = before.guestRequest;
+      const birthDate = input.birthDate ?? kept?.birthDate;
+      if (birthDate && (input.birthDate || input.acceptedTerms)) {
+        before.guestRequest = { birthDate, acceptedTerms: input.acceptedTerms ?? (input.birthDate ? CURRENT_TERMS : kept!.acceptedTerms) };
+        await this.saveMeta(before);
+      }
+      let granted;
+      try {
+        granted = await this.deviceKeyGrant(before.guestRequest);
+      } catch (err) {
+        // A refusal that no retry changes ends the request: it is not tried again at every launch.
+        if (isKrtuworksError(err) && PERMANENT_GUEST_REFUSALS.has(err.code) && before.guestRequest) {
+          before.guestRequest = null;
+          await this.saveMeta(before);
+        }
+        throw err;
+      }
       const now = await this.meta();
       if (now.epoch !== epoch) throw new KrtuworksError('context_changed', 'A sign-in started while the guest was being made; the guest was not used.');
       now.guestRequest = null;
       await this.saveMeta(now);
-      await this.adopt(tokens);
-      return { player: this.player!, created, fresh: true };
+      await this.adopt(granted.tokens);
+      return { player: this.player!, created: granted.created, fresh: true };
     });
     if (result.fresh) this.emit({ type: 'guest', player: result.player, created: result.created });
     return result.player;
@@ -443,7 +486,16 @@ export class Identity {
     }
     const pending: PendingSignIn = { verifier, nonce, redirectUri, epoch, startedAt: Date.now() };
     await this.ctx.store.set(this.key(`signin:${state}`), pending);
+    await this.sweepSignIns();
     return `${this.ctx.opts.idOrigin}/oidc/auth?${params}`;
+  }
+
+  /** Forgets the sign-ins the player started and never came back to. */
+  private async sweepSignIns(): Promise<void> {
+    for (const key of await this.ctx.store.keys(this.key('signin:'))) {
+      const pending = await this.ctx.store.get<PendingSignIn>(key);
+      if (!pending || Date.now() - pending.startedAt > PENDING_TTL_MS) await this.ctx.store.delete(key);
+    }
   }
 
   /** Finishes a sign-in from the address the player came back to. */

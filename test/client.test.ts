@@ -69,6 +69,19 @@ test("an app that is not a game keeps no levels or deaths and has no game module
   }
 });
 
+test('modules() reports every server module, leaderboards included, and honours its switch (control: a module never switched stays on)', async () => {
+  const server = new FakeServer();
+  guestRoutes(server);
+  configRoute(server, { modules: { leaderboards: false } });
+  const krtu = await Krtuworks.initialize(options(server));
+  await krtu.refreshConfig();
+  const modules = krtu.modules();
+  assert.ok('leaderboards' in modules);
+  assert.equal(modules.leaderboards, false);
+  assert.equal(modules.presence, true);
+  await krtu.shutdown();
+});
+
 test("the owner's TELEMETRY switch on this build stops events; another build's switch does not", async () => {
   const server = new FakeServer();
   guestRoutes(server);

@@ -4,6 +4,29 @@ All notable changes to `@krtuworks/sdk`. Versions follow semantic versioning; a 
 
 ## Unreleased
 
+## 1.0.8 - 2026-11-26
+
+### Fixed
+- A refresh the server refuses (a frozen app answers `app_suspended`) no longer deletes what is queued. Before, the refusal reached the queues as if the server had rejected the item, so waiting events, bug reports and saves were dropped. An error raised while the player's credentials are fetched or refreshed (`KrtuworksError.authLayer`) now keeps every queued item and backs the queue off.
+- A save is kept on the device when the server refuses it for a reason that can lift: `account_merged` (it waits for `adoptWaiting` or `discardWaiting`), `sanctioned`, `account_deletion_pending`, `switched_off`, `module_disabled`, `app_suspended`. Before, any non-retryable refusal deleted the save. Events, bug reports and progress also wait on these refusals and back off 15 minutes (or the server's Retry-After) instead of retrying at once.
+- A deleted account (`401 account_deleted`) signs the player out with reason `account_deleted` and drops what waited for them; before, the queues retried forever and the player stayed signed in.
+- A transient `409 app_transferring` or `account_merging` on a bug report's screenshot keeps the screenshot for another try; before it was dropped although the report was accepted.
+- A failed session open is tried again (growing wait, the server's Retry-After, the page coming back online, the next flush); before, one failure left the whole run without a session. An open in flight for another player is no longer handed to the player who replaced them.
+- A remote config answer that is not a config (a 200 from a captive portal or proxy) is a failed fetch: the kept copy stays and nothing is stored. Before, it replaced the kept config with an empty one and switched every owner switch off.
+- An open level attempt belongs to its player: after the player changes, `complete`, `fail` and the rest are not told under the new player. A level started before any player goes on to the first player.
+- A guest's age answers are written under the identity lock, so a concurrent sign-in or merge can no longer be overwritten. A refused date of birth (`too_young`, `invalid_birth_date`) ends the stored request instead of being tried at every launch, and new terms alone (`acceptedTerms`) update a stored request.
+- Events a refused store write took stay in memory and are written next time; before, they were lost.
+- The event queue's 30-day limit, `Retry-After` dates and the conflict screen's "Newer" mark are read on the server's clock, not the device's. A device clock that was behind no longer drops events or steers the player to the cloud save.
+- A save refused as `file_conflict` after a 202 carries the slot's current version (`details.current`), so `ui.save` opens the chooser.
+- Sign-ins the player never came back to are swept from the store. The refusals kept for diagnostics (`progressRefusals`) are bounded at 100, and a bug report's wait entry goes with the report.
+- A pending deletion and a deleted account have their own error screens (no retry loop): "cancel the deletion or download your data".
+
+### Added
+- Settings saves (no `base`) go out at most once per 30 seconds per slot, the newest content winning, and at once when the page is hidden or `shutdown()` runs; `files.flushWrites()` does it on demand. A `too_many_writes` answer is tried again after its Retry-After.
+- `{ type: 'merging', state: 'started' | 'ended' }` identity change while the server answers `account_merging`.
+- `"firstLaunch": "online"` in `krtuworks-config.json`, `krtu.startup` (`ready` | `first_launch_offline`) and `onStartupChange`; `krtu.serverNow()`.
+- `KrtuworksError.authLayer`, `.waiting` and `.keepsQueued`; the `signed_out` identity change carries `subject` when the reason is `account_deleted`.
+
 ## 1.0.7 - 2026-11-25
 
 ### Fixed

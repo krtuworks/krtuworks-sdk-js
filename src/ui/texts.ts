@@ -58,6 +58,8 @@ export const UI_TEXTS = {
   'error.bannedUntil': 'This ends on {date}.',
   'error.maintenance': 'Online features are down for maintenance.',
   'error.update': 'A new version is out. Update the game to keep playing online.',
+  'error.deletionPending': 'This account is waiting to be deleted. You can cancel the deletion or download your data.',
+  'error.deleted': 'This account was deleted.',
   'error.busy': 'Too many new players right now. Try again in a moment.',
   'error.generic': 'Something went wrong. Try again in a moment.',
   'error.retry': 'Try again',

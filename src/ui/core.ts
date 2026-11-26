@@ -108,6 +108,10 @@ export function errorScreen(err: unknown, texts: UiTexts, locale: string): { mes
     case 'guest_limit':
     case 'guest_capacity':
       return { message: t('error.busy'), retry: true };
+    case 'account_deletion_pending':
+      return { message: t('error.deletionPending'), retry: false };
+    case 'account_deleted':
+      return { message: t('error.deleted'), retry: false };
     case 'app_suspended':
     case 'maintenance':
       return { message: t('error.maintenance'), retry: true };
@@ -227,7 +231,7 @@ export class KrtuworksUi {
       if (!read?.version) return { kept: 'here', version: await this.client.files.save(input.slot, input.bytes, { base: null }) };
       const there = { ...current, id: read.version.id, generation: read.version.generation, savedAt: read.version.savedAt, sizeBytes: read.bytes.length };
       const theirs = read.bytes;
-      const now = this.now();
+      const now = this.serverDate();
       const hereCard = await this.card(this.t('conflict.here'), now.toISOString(), input.bytes.length, input.slot, input.bytes);
       const thereLabel = there.platform ? `${this.t('conflict.there')} · ${this.platformName(there.platform)}` : this.t('conflict.there');
       const thereCard = await this.card(thereLabel, there.savedAt, there.sizeBytes, input.slot, theirs);
@@ -368,7 +372,12 @@ export class KrtuworksUi {
         summary = null;
       }
     }
-    return { label, newer: false, when: savedWhen(savedAt, this.now(), this.locale, this.texts), size: fileSize(sizeBytes), summary };
+    return { label, newer: false, when: savedWhen(savedAt, this.serverDate(), this.locale, this.texts), size: fileSize(sizeBytes), summary };
+  }
+
+  /** Now on the server's clock (the save times are the server's); a test or game that sets `now` decides it itself. */
+  private serverDate(): Date {
+    return this.options.now ? this.options.now() : new Date(this.client.serverNow());
   }
 
   private playerSubject(): string | null {

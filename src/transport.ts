@@ -8,6 +8,8 @@ export interface Answer {
   json: Record<string, unknown> | null;
   /** The raw body, when asked for (file reads). */
   bytes: Uint8Array | null;
+  /** Seconds the server asked to wait (body or `Retry-After`; a date counts from the server's clock), or null. */
+  retryAfter: number | null;
 }
 
 export interface SendInit {
@@ -30,7 +32,7 @@ export interface SendInit {
  */
 export const REQUEST_TIMEOUT_MS = 30_000;
 
-function retryAfterOf(headers: Headers, json: Record<string, unknown> | null): number | null {
+function retryAfterOf(clock: Clock, headers: Headers, json: Record<string, unknown> | null): number | null {
   const fromBody = json?.retryAfter;
   if (typeof fromBody === 'number' && Number.isFinite(fromBody)) return fromBody;
   const header = headers.get('retry-after');
@@ -38,7 +40,7 @@ function retryAfterOf(headers: Headers, json: Record<string, unknown> | null): n
   const seconds = Number(header);
   if (Number.isFinite(seconds)) return seconds;
   const at = Date.parse(header);
-  return Number.isFinite(at) ? Math.max(0, Math.ceil((at - Date.now()) / 1000)) : null;
+  return Number.isFinite(at) ? Math.max(0, Math.ceil((at - clock.serverNow()) / 1000)) : null;
 }
 
 /**
@@ -59,7 +61,7 @@ export function errorOf(answer: Answer): KrtuworksError {
     if (typeof description === 'string') message = description;
     rest.description = description;
   }
-  return new KrtuworksError(code, message, answer.status, retryAfterOf(answer.headers, answer.json), rest);
+  return new KrtuworksError(code, message, answer.status, answer.retryAfter, rest);
 }
 
 /**
@@ -112,7 +114,7 @@ export async function send(fetchFn: typeof fetch, clock: Clock, url: string, ini
       throw new KrtuworksError('network_error', `The answer from ${host} was cut: ${(err as Error)?.message ?? String(err)}`, res.status);
     }
     if (json && typeof json.serverTime === 'string') clock.noteServerTime(json.serverTime);
-    return { status: res.status, headers: res.headers, json, bytes };
+    return { status: res.status, headers: res.headers, json, bytes, retryAfter: retryAfterOf(clock, res.headers, json) };
   } finally {
     clearTimeout(timer);
   }

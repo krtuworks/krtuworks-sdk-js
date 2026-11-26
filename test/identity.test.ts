@@ -103,6 +103,28 @@ test('a second tab that already refreshed is used instead of spending the token 
   assert.equal(server.calls.filter((c) => c.form?.get('grant_type') === 'refresh_token').length, 1, 'no second refresh');
 });
 
+test('a sign-out in another tab is told to this tab once (control: a tab that was already signed out hears nothing)', async () => {
+  const server = new FakeServer();
+  guestRoutes(server);
+  server.on('POST', '/oidc/token/revocation', () => ({ status: 200 }));
+  const store = memoryStore();
+  const tabA = identityOn(server, store).identity;
+  await tabA.signInAsGuest({ birthDate: '2000-01-01', acceptedTerms: 'TERMS:v1 PRIVACY:v1' });
+  const tabB = identityOn(server, store).identity;
+  await tabB.load();
+  const heardA: string[] = [];
+  const heardB: string[] = [];
+  tabA.onChange((c) => heardA.push(c.type));
+  tabB.onChange((c) => heardB.push(c.type));
+  await tabB.signOut();
+  assert.deepEqual(heardB, ['signed_out']);
+  await assert.rejects(tabA.accessToken(true), (e: unknown) => isKrtuworksError(e, 'signed_out'));
+  assert.deepEqual(heardA, ['signed_out']);
+  assert.equal(tabA.player, null);
+  await assert.rejects(tabB.accessToken(true), (e: unknown) => isKrtuworksError(e, 'signed_out'));
+  assert.deepEqual(heardB, ['signed_out'], 'no second notice for a tab that was already signed out');
+});
+
 test('a refresh refused as account_merged signs out and keeps the player waiting for the merge check', async () => {
   const server = new FakeServer();
   guestRoutes(server);
