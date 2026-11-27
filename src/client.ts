@@ -701,7 +701,17 @@ export class Krtuworks {
   async refreshConfig(): Promise<void> {
     await this.config.refresh();
     this.setFirstLaunchOffline(false);
+    this.applySessionsSwitch();
     await this.refreshPresence();
+  }
+
+  /** The sessions switch as the config has it now, with no new build: on opens the player's session, off ends it. */
+  private applySessionsSwitch(): void {
+    if (!this.options.sessions || this.stopped) return;
+    const on = this.config.moduleOn('sessions');
+    // A failed open is tried again when its wait is over.
+    if (on && this.identity.player && !this.sessions.session && !this.sessions.retrying) void this.sessions.start();
+    else if (!on && this.sessions.session) void this.sessions.end();
   }
 
   /**

@@ -4,6 +4,11 @@ All notable changes to `@krtuworks/sdk`. Versions follow semantic versioning; a 
 
 ## Unreleased
 
+## 1.0.13 - 2026-11-27
+
+### Fixed
+- Switching the `sessions` module on or off takes effect on the next config read, with no new build: on opens the player's session, off ends it and its heartbeats. Before, a game that started with the module off never opened a session after it was switched on, and an open session kept its heartbeats after it was switched off.
+
 ## 1.0.12 - 2026-11-26
 
 ### Fixed

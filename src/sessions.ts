@@ -106,6 +106,11 @@ export class SessionKeeper {
     }
   }
 
+  /** A failed open waits for its time to be tried again. */
+  get retrying(): boolean {
+    return this.retryTimer !== null;
+  }
+
   /** Tries a failed open again now when none is waiting for its time (a flush, the page back online). */
   ensure(force = false): void {
     if (!this.wanted || this.session || this.opening || !this.subject()) return;
