@@ -6,6 +6,9 @@ import { uuidV7 } from './ids.js';
 import { withLock } from './locks.js';
 import type { KrtuStore } from './store.js';
 
+/** The server's refusal while the app does not ship on this platform yet: the events wait for the platform to be added. */
+const PLATFORM_NOT_REGISTERED = 'platform_not_registered';
+
 export interface EventPosition {
   space: 'world' | 'screen';
   area: string;
@@ -355,8 +358,9 @@ export class EventQueue {
       await this.unfreeze(owner, batch);
       return 'done';
     }
-    if (err.authLayer || err.waiting) {
-      // Not a refusal of this batch (the credentials failed, or the refusal can lift): it stays, frozen, for later.
+    if (err.authLayer || err.waiting || err.code === PLATFORM_NOT_REGISTERED) {
+      // Not a refusal of this batch (the credentials failed, the refusal can lift, or the app does not ship on this
+      // platform yet): it stays, frozen, for later.
       this.backoff(err);
       return err.code;
     }
@@ -378,7 +382,7 @@ export class EventQueue {
 
   private backoff(err: KrtuworksError): void {
     this.backoffMs = Math.min(300_000, Math.max(5_000, this.backoffMs * 2));
-    const wait = err.retryAfter !== null ? err.retryAfter * 1000 : err.waiting ? WAITING_BACKOFF_MS : this.backoffMs;
+    const wait = err.retryAfter !== null ? err.retryAfter * 1000 : err.waiting || err.code === PLATFORM_NOT_REGISTERED ? WAITING_BACKOFF_MS : this.backoffMs;
     this.notBefore = Date.now() + wait;
   }
 

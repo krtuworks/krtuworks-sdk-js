@@ -27,6 +27,8 @@ export class SessionKeeper {
   private opening: Promise<SessionInfo | null> | null = null;
   /** The player the open in flight is for. */
   private openingFor: string | null = null;
+  /** The `generation` the open in flight began in: a `close` since then makes its answer nobody's. */
+  private openingGeneration = 0;
   /** The app wants a session (`start` ran): a failed open is tried again until one is open or `close`. */
   private wanted = false;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -40,6 +42,8 @@ export class SessionKeeper {
     private readonly subject: () => string | null,
     /** Told the licence list of a session answer (only an open that sent a platform proof gets one). */
     private readonly onEntitlements: (items: unknown) => Promise<void> = async () => undefined,
+    /** Whether a session is wanted now (sessions on, the module on, the build not switched off); a failed open is tried again only then. */
+    private readonly allowed: () => boolean = () => true,
   ) {}
 
   get session(): SessionInfo | null {
@@ -76,12 +80,13 @@ export class SessionKeeper {
   /** Opens the player's session if there is none (one at a time). */
   async open(): Promise<SessionInfo | null> {
     if (this.session) return this.session;
-    if (this.opening && this.openingFor !== this.subject()) {
-      // The open in flight is another player's: its answer is not this player's session.
+    if (this.opening && (this.openingFor !== this.subject() || this.openingGeneration !== this.generation)) {
+      // The open in flight is another player's, or was closed since: its answer is not this player's session.
       await this.opening.catch(() => undefined);
       return this.open();
     }
     this.openingFor = this.subject();
+    this.openingGeneration = this.generation;
     this.opening ??= this.doOpen().finally(() => {
       this.opening = null;
     });
@@ -96,9 +101,12 @@ export class SessionKeeper {
   async start(): Promise<SessionInfo | null> {
     this.wanted = true;
     this.cancelRetry();
+    const generation = this.generation;
     try {
       const session = await this.open();
       if (session) this.retryMs = 0;
+      // No session and no error: the answer was nobody's. A close in between ended the request; the start after it owns the retry.
+      else if (this.wanted && this.subject() && this.generation === generation) this.scheduleRetry(null);
       return session;
     } catch (err) {
       this.scheduleRetry(isKrtuworksError(err) ? err : null);
@@ -113,7 +121,7 @@ export class SessionKeeper {
 
   /** Tries a failed open again now when none is waiting for its time (a flush, the page back online). */
   ensure(force = false): void {
-    if (!this.wanted || this.session || this.opening || !this.subject()) return;
+    if (!this.wanted || !this.allowed() || this.session || this.opening || !this.subject()) return;
     if (this.retryTimer && !force) return;
     void this.start();
   }

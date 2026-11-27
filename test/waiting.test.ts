@@ -163,6 +163,34 @@ test('events and progress wait on a waiting refusal and back off a long while; a
   }
 });
 
+test('a batch refused with platform_not_registered stays and waits 15 minutes, then goes once the platform is added (control: another 400 drops it)', async () => {
+  for (const code of ['platform_not_registered', 'invalid_request']) {
+    const server = new FakeServer();
+    const { events, store } = await rig(server);
+    events.add({ type: 'screen_view', data: { screen: 'a' } });
+    let registered = false;
+    server.on('POST', '/v1/events', () => (registered ? { status: 200, json: { accepted: 1, duplicate: 0, rejected: [], retry: [] } } : refusal(400, code)));
+    const first = await events.flush();
+    assert.equal(first.stoppedBy, code);
+    const state = await store.get<{ pending: unknown[]; batch: { events: unknown[] } | null; dropped: number }>(EVENTS);
+    if (code === 'invalid_request') {
+      assert.equal(state?.batch ?? null, null, 'a refusal of the batch itself drops it');
+      assert.equal(state?.dropped, 1);
+      continue;
+    }
+    assert.equal(state?.batch?.events.length, 1, 'the frozen batch stays');
+    assert.equal(state?.dropped, 0);
+    assert.equal((await events.flush()).stoppedBy, 'waiting');
+    const wait = (events as unknown as { notBefore: number }).notBefore - Date.now();
+    assert.ok(wait > 14 * 60_000 && wait <= 15 * 60_000, 'the long wait of the waiting refusals');
+    registered = true;
+    events.resetBackoff();
+    const sent = await events.flush();
+    assert.equal(sent.sent, 1, 'the same events arrive once the platform is added');
+    assert.equal((await store.get<{ batch: unknown }>(EVENTS))?.batch ?? null, null);
+  }
+});
+
 // ── Bug screenshot ─────────────────────────────────────────────────────────
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
@@ -418,6 +446,89 @@ test('an open in flight for another player is not handed to this one (control: t
     }
     keeper.close();
   }
+});
+
+/** An Api whose session opens answer by hand and whose ends are kept. */
+function holdingApi() {
+  const releases: Array<() => void> = [];
+  const ended: string[] = [];
+  let opens = 0;
+  const api = {
+    player: async (path: string) => {
+      if (path === '/v1/sessions') {
+        opens += 1;
+        const id = `s${opens}`;
+        await new Promise<void>((resolve) => releases.push(resolve));
+        return { json: { session: { id, startedAt: '2026-06-01T00:00:00Z' }, heartbeatSeconds: 3600 } };
+      }
+      if (path.endsWith('/end')) ended.push(path.split('/')[3]!);
+      return { json: {} };
+    },
+  } as unknown as Api;
+  return { api, releases, ended, opens: () => opens };
+}
+
+test('a close while an open is in flight: the next start opens a fresh session and the late one is ended (control: without a close the start shares the open)', async () => {
+  for (const closed of [false, true]) {
+    const { api, releases, ended, opens } = holdingApi();
+    const keeper = new SessionKeeper(resolveOptions(options(new FakeServer())), api, () => A);
+    const first = keeper.start();
+    await new Promise((r) => setTimeout(r, 5));
+    if (closed) keeper.close();
+    const second = keeper.start();
+    await new Promise((r) => setTimeout(r, 5));
+    releases.splice(0).forEach((r) => r());
+    await new Promise((r) => setTimeout(r, 5));
+    releases.splice(0).forEach((r) => r());
+    await Promise.all([first, second]);
+    if (closed) {
+      assert.equal(opens(), 2, 'a fresh open after the close');
+      assert.deepEqual(ended, ['s1'], 'the late session is ended on the server');
+      assert.equal(keeper.session?.id, 's2');
+      assert.equal(keeper.retrying, false);
+    } else {
+      assert.equal(opens(), 1);
+      assert.equal(keeper.session?.id, 's1');
+    }
+    keeper.close();
+  }
+});
+
+test('a late open that answers null leaves the keeper retrying (control: a session that opened needs no retry)', async () => {
+  const { api, releases } = holdingApi();
+  let player: string | null = A;
+  const keeper = new SessionKeeper(resolveOptions(options(new FakeServer())), api, () => player);
+  const started = keeper.start();
+  await new Promise((r) => setTimeout(r, 5));
+  player = 'pw_other_bbbbbbbbbbbb';
+  releases.splice(0).forEach((r) => r());
+  assert.equal(await started, null, 'the answer belongs to the player who left');
+  assert.equal(keeper.retrying, true, 'the keeper still wants a session and waits to try again');
+  keeper.close();
+  assert.equal(keeper.retrying, false);
+});
+
+test('a failed open is not tried again while sessions are not allowed (control: allowed again, it opens)', async () => {
+  let calls = 0;
+  let allowed = true;
+  const api = {
+    player: async () => {
+      calls += 1;
+      if (calls === 1) throw new KrtuworksError('network_error', 'offline');
+      return { json: { session: { id: 's2', startedAt: '2026-06-01T00:00:00Z' }, heartbeatSeconds: 3600 } };
+    },
+  } as unknown as Api;
+  const keeper = new SessionKeeper(resolveOptions(options(new FakeServer())), api, () => A, undefined, () => allowed);
+  assert.equal(await keeper.start(), null);
+  allowed = false;
+  keeper.ensure(true);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(calls, 1, 'the module is off: no open');
+  allowed = true;
+  keeper.ensure(true);
+  await until(() => keeper.session !== null);
+  assert.equal(calls, 2);
+  keeper.close();
 });
 
 // ── Identity ────────────────────────────────────────────────────────────────

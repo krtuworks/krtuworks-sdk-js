@@ -86,3 +86,53 @@ test("a config read leaves a refused session open to its wait: the server's Retr
   assert.equal(server.count('POST', '/v1/sessions'), opened, 'an open session is not opened again');
   await krtu.shutdown();
 });
+
+test('a failed open waiting for its retry does not open once the module is off or the build is switched off (control: the module back on opens it)', async () => {
+  const server = new FakeServer();
+  guestRoutes(server);
+  let modules: Record<string, boolean> = { sessions: true };
+  let switches: unknown[] = [];
+  let version = 1;
+  server.on('GET', '/v1/apps/buried/config', () => ({
+    json: { appId: 'app_x', environment: 'TEST', platform: 'WEB', version: `${version}.0`, config: { modules }, switches, serverTime: new Date().toISOString() },
+    headers: { etag: `"v${version}"` },
+  }));
+  server.on('GET', '/v1/me/telemetry-opt-out', () => ({ json: { optedOut: false, updatedAt: null } }));
+  let refuse = true;
+  server.on('POST', '/v1/sessions', () =>
+    refuse
+      ? { status: 503, json: { error: { code: 'busy', message: 'Busy.' } } }
+      : { status: 201, json: { session: { id: `ses_${'a'.repeat(20)}`, startedAt: new Date().toISOString() }, heartbeatSeconds: 60, serverTime: new Date().toISOString() } },
+  );
+  const krtu = await Krtuworks.initialize(options(server, { sessions: true }));
+  await krtu.signInAsGuest({ birthDate: '2000-01-01', acceptedTerms: 'TERMS:v1 PRIVACY:v1' });
+  await krtu.ready();
+  await new Promise((r) => setTimeout(r, 30));
+  const refused = server.count('POST', '/v1/sessions');
+  assert.ok(refused >= 1, 'the open was tried and refused');
+  const keeper = (krtu as unknown as { sessions: { ensure(force: boolean): void } }).sessions;
+  refuse = false;
+  const flip = async (nextModules: Record<string, boolean>, nextSwitches: unknown[]) => {
+    modules = nextModules;
+    switches = nextSwitches;
+    version += 1;
+    await krtu.refreshConfig();
+    await new Promise((r) => setTimeout(r, 30));
+  };
+
+  await flip({ sessions: false }, []);
+  keeper.ensure(true);
+  await krtu.flush();
+  assert.equal(server.count('POST', '/v1/sessions'), refused, 'the module is off: the retry stays quiet');
+
+  await flip({ sessions: true }, [{ build: '*', mode: 'ALL' }]);
+  keeper.ensure(true);
+  await krtu.flush();
+  assert.equal(server.count('POST', '/v1/sessions'), refused, 'the build is switched off: the retry stays quiet');
+
+  await flip({ sessions: true }, []);
+  keeper.ensure(true);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(server.count('POST', '/v1/sessions'), refused + 1, 'allowed again: the session opens');
+  await krtu.shutdown();
+});

@@ -4,6 +4,13 @@ All notable changes to `@krtuworks/sdk`. Versions follow semantic versioning; a 
 
 ## Unreleased
 
+## 1.0.14 - 2026-11-27
+
+### Fixed
+- A session whose open was still on its way when the player left or the SDK closed it no longer blocks the next one: a `start()` after the close opens a fresh session, and a late answer that belongs to nobody leaves the SDK retrying instead of without a session.
+- A failed session open is no longer retried after the `sessions` module is switched off or the build is switched off altogether (`ALL`); it is tried again once sessions are allowed.
+- Events refused because the app does not ship on the platform yet (`platform_not_registered`) are kept and sent again after the 15 minute wait, so they arrive once the platform is added. Before, the whole batch (up to 500 events) was dropped. The on-device limits (50 000 events, 20 MiB, 30 days) still apply.
+
 ## 1.0.13 - 2026-11-27
 
 ### Fixed

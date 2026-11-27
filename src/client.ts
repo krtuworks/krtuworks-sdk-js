@@ -190,7 +190,13 @@ export class Krtuworks {
     this.events = new EventQueue({ opts: this.options, store: this.store, clock: this.clock, api: this.api, subject });
     this.progress = new ProgressQueue({ opts: this.options, store: this.store, api: this.api, subject });
     this.licences = new Entitlements(this.options.clientId, this.store, this.api, subject);
-    this.sessions = new SessionKeeper(this.options, this.api, subject, (items) => this.licences.fromSession(items));
+    this.sessions = new SessionKeeper(
+      this.options,
+      this.api,
+      subject,
+      (items) => this.licences.fromSession(items),
+      () => this.options.sessions && this.config.moduleOn('sessions') && this.config.switchForBuild()?.mode !== 'ALL',
+    );
     this.config = new RemoteConfig(this.options, this.api, this.store);
     this.bugs = new BugReports(this.options, this.store, this.api, () => subject() ?? ANON, subject);
     this.presence = new Presence(this.options.clientId, this.store, this.api, subject);
