@@ -4,6 +4,12 @@ All notable changes to `@krtuworks/sdk`. Versions follow semantic versioning; a 
 
 ## Unreleased
 
+## 1.0.17 - 2026-11-27
+
+### Fixed
+- The device description is now cut to what the server takes (OS and OS version 40 characters, model 80, GPU 120, language tag 35) before it goes out, and parts that are empty or out of range are left out. Before, a device model of more than 80 characters made every session open and every bug report be refused as a bad request.
+- A stat or score reported while the SDK is still reading what the server taught it stays with the player who reported it. Before, a player change in that moment could file it under the next player.
+
 ## 1.0.16 - 2026-11-27
 
 ### Fixed

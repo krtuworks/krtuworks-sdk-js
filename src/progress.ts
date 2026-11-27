@@ -202,8 +202,9 @@ export class ProgressQueue {
   async report(type: 'add' | 'set', key: string, value: number): Promise<void> {
     if (!KEY.test(key)) throw new TypeError(`"${key}" is not a stat key (lowercase letters, digits, _ and ., at most 64)`);
     if (!Number.isFinite(value) || Math.abs(value) >= MAX_VALUE) throw new TypeError('a stat value is a finite number below 10^15');
-    await this.loadKinds();
+    // The player of the call is taken before anything is awaited: a switch while the kinds load leaves this write with the first player.
     const owner = this.ctx.subject() ?? 'anon';
+    await this.loadKinds();
     await withLock(this.key(owner), async () => {
       const state = await this.load(owner);
       const entry = (state.stats[key] ??= { inFlight: [], pending: [] });
@@ -218,8 +219,9 @@ export class ProgressQueue {
     if (details !== undefined && (!(details instanceof Uint8Array) || details.length < 1 || details.length > MAX_DETAILS)) {
       throw new TypeError(`score details are 1-${MAX_DETAILS} bytes`);
     }
-    await this.loadKinds();
+    // The player of the call is taken before anything is awaited: a switch while the kinds load leaves this write with the first player.
     const owner = this.ctx.subject() ?? 'anon';
+    await this.loadKinds();
     await withLock(this.key(owner), async () => {
       const state = await this.load(owner);
       const entry = (state.scores[key] ??= { inFlight: [], pending: [] });

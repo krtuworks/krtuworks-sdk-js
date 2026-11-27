@@ -32,6 +32,35 @@ export interface DeviceInfo {
   screenHeight?: number;
 }
 
+function deviceText(value: unknown, max: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  let text = value.trim();
+  if (text.length > max) {
+    // Never cut a surrogate pair in half.
+    const code = text.charCodeAt(max - 1);
+    text = text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max).trim();
+  }
+  return text || undefined;
+}
+
+function deviceNumber(value: unknown, max: number): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= max ? value : undefined;
+}
+
+/** The device as the server takes it: text trimmed and cut to its limits, empty parts and numbers out of range left out. */
+export function cleanDevice(device: DeviceInfo): DeviceInfo {
+  const clean: DeviceInfo = {
+    os: deviceText(device.os, 40),
+    osVersion: deviceText(device.osVersion, 40),
+    model: deviceText(device.model, 80),
+    gpu: deviceText(device.gpu, 120),
+    ramMb: deviceNumber(device.ramMb, 10_000_000),
+    screenWidth: deviceNumber(device.screenWidth, 100_000),
+    screenHeight: deviceNumber(device.screenHeight, 100_000),
+  };
+  return Object.fromEntries(Object.entries(clean).filter(([, v]) => v !== undefined)) as DeviceInfo;
+}
+
 export interface KrtuworksOptions {
   config: KrtuworksAppConfig;
   environment: Environment;
@@ -143,8 +172,8 @@ export function resolveOptions(options: KrtuworksOptions): ResolvedOptions {
     redirectUri: options.redirectUri ?? null,
     idOrigin: (options.idOrigin ?? ID_ORIGIN).replace(/\/+$/, ''),
     devOrigin: (options.devOrigin ?? DEV_ORIGIN).replace(/\/+$/, ''),
-    device: options.device ?? null,
-    locale: options.locale ?? null,
+    device: options.device ? cleanDevice(options.device) : null,
+    locale: options.locale ? deviceText(options.locale, 35) ?? null : null,
     sessions: options.sessions ?? true,
     positionSampleSeconds: sampleInterval(options.positionSampleSeconds),
   };
