@@ -122,3 +122,64 @@ test('only a Steam game fetches on its own; another platform does it on request 
   assert.equal(app.server.count('GET', '/v1/me/entitlements'), 0);
   await notGame.shutdown();
 });
+
+test("a session answer for one player never lands in the next player's licences, while the kept list is still being read", async () => {
+  const { Entitlements } = await import('../src/entitlements.js');
+  let subject = 'pw_a';
+  let release: () => void = () => {};
+  const slowA = new Promise<void>((resolve) => (release = resolve));
+  const kept = new Map<string, unknown>();
+  const store = {
+    get: async <T>(key: string): Promise<T | null> => {
+      if (key.endsWith(':pw_a')) await slowA;
+      return (kept.get(key) as T) ?? null;
+    },
+    set: async (key: string, value: unknown) => void kept.set(key, value),
+    delete: async (key: string) => void kept.delete(key),
+  };
+  const answers: Record<string, Item[]> = { pw_a: [item('expansion', 'ACTIVE', true)], pw_b: [] };
+  const api = { player: async (_path: string, call: { owner?: string } = {}) => ({ json: { entitlements: answers[call.owner ?? subject] } }) };
+  const licences = new Entitlements('c', store as never, api as never, () => subject);
+
+  const forA = licences.fromSession(answers.pw_a);
+  subject = 'pw_b';
+  await licences.refresh();
+  release();
+  await forA;
+  assert.equal(licences.ownsDlc('expansion'), false, "A's confirmed DLC is not B's");
+  assert.deepEqual(licences.list(), []);
+  assert.equal(kept.has('krtu:c:entitlements:pw_b') && (kept.get('krtu:c:entitlements:pw_b') as unknown[]).length, 0);
+
+  // Control: B's own session answer is taken.
+  await licences.fromSession([item('expansion', 'ACTIVE', true)]);
+  assert.equal(licences.ownsDlc('expansion'), true);
+});
+
+test("a refresh answered after the player changed is dropped, and its call was made for the player who asked", async () => {
+  const { Entitlements } = await import('../src/entitlements.js');
+  let subject = 'pw_a';
+  let answer: (v: unknown) => void = () => {};
+  const owners: (string | undefined)[] = [];
+  const kept = new Map<string, unknown>();
+  const store = {
+    get: async <T>(key: string): Promise<T | null> => (kept.get(key) as T) ?? null,
+    set: async (key: string, value: unknown) => void kept.set(key, value),
+    delete: async (key: string) => void kept.delete(key),
+  };
+  const api = {
+    player: (_path: string, call: { owner?: string } = {}) => {
+      owners.push(call.owner);
+      return call.owner === 'pw_a' ? new Promise((resolve) => (answer = resolve)) : Promise.resolve({ json: { entitlements: [] } });
+    },
+  };
+  const licences = new Entitlements('c', store as never, api as never, () => subject);
+  const forA = licences.refresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  subject = 'pw_b';
+  await licences.ensureLoaded();
+  answer({ json: { entitlements: [item('expansion', 'ACTIVE')] } });
+  assert.deepEqual(await forA, []);
+  assert.equal(licences.ownsDlc('expansion'), false);
+  assert.equal(kept.get('krtu:c:entitlements:pw_b'), undefined, "nothing of A's answer is written as B's");
+  assert.deepEqual(owners, ['pw_a']);
+});

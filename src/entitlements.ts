@@ -56,7 +56,13 @@ export class Entitlements {
   /** Reads the current player's kept list. */
   async load(): Promise<void> {
     const subject = this.subject();
-    this.cached = subject ? { subject, stored: (await this.store.get<Stored[]>(this.key(subject))) ?? [], confirmed: new Map() } : null;
+    if (!subject) {
+      this.cached = null;
+      return;
+    }
+    const stored = (await this.store.get<Stored[]>(this.key(subject))) ?? [];
+    // The player changed while the list was read: that player's own read fills the cache.
+    if (this.subject() === subject) this.cached = { subject, stored, confirmed: new Map() };
   }
 
   /** Reads the kept list unless this player's is already held (a launch's confirmed answers stay). */
@@ -91,7 +97,7 @@ export class Entitlements {
     if (!subject || !items.length) return;
     await this.ensureLoaded();
     const held = this.current();
-    if (!held) return;
+    if (!held || held.subject !== subject) return;
     held.confirmed = new Map(items.filter((i) => i.checked).map((i) => [i.sku, i]));
     await this.keep(held, items.map(({ checked: _checked, ...rest }) => rest));
   }
@@ -101,9 +107,9 @@ export class Entitlements {
     const subject = this.subject();
     if (!subject) return [];
     await this.ensureLoaded();
-    const answer = await this.api.player('/v1/me/entitlements');
+    const answer = await this.api.player('/v1/me/entitlements', { owner: subject });
     const held = this.current();
-    if (!held) return [];
+    if (!held || held.subject !== subject) return [];
     const items = itemsOf(answer.json?.entitlements);
     const listed = new Set(items.map((i) => i.sku));
     const unlisted = held.stored.filter((s) => !listed.has(s.sku)).map((s) => ({ ...s, status: null }));
