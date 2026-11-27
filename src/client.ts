@@ -195,7 +195,7 @@ export class Krtuworks {
       this.api,
       subject,
       (items) => this.licences.fromSession(items),
-      () => this.options.sessions && this.config.moduleOn('sessions') && this.config.switchForBuild()?.mode !== 'ALL',
+      () => this.sessionsAllowed(),
     );
     this.config = new RemoteConfig(this.options, this.api, this.store);
     this.bugs = new BugReports(this.options, this.store, this.api, () => subject() ?? ANON, subject);
@@ -714,10 +714,16 @@ export class Krtuworks {
   /** The sessions switch as the config has it now, with no new build: on opens the player's session, off ends it. */
   private applySessionsSwitch(): void {
     if (!this.options.sessions || this.stopped) return;
-    const on = this.config.moduleOn('sessions');
+    const on = this.sessionsAllowed();
     // A failed open is tried again when its wait is over.
     if (on && this.identity.player && !this.sessions.session && !this.sessions.retrying) void this.sessions.start();
-    else if (!on && this.sessions.session) void this.sessions.end();
+    // Off ends the session, and also an open still on its way and a retry waiting: nothing opens or beats after it.
+    else if (!on) void this.sessions.end();
+  }
+
+  /** Whether the app wants a play session now: sessions on in the options, the module on, the build not switched off. */
+  private sessionsAllowed(): boolean {
+    return this.options.sessions && this.config.moduleOn('sessions') && this.config.switchForBuild()?.mode !== 'ALL';
   }
 
   /**

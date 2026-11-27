@@ -136,3 +136,54 @@ test('a failed open waiting for its retry does not open once the module is off o
   assert.equal(server.count('POST', '/v1/sessions'), refused + 1, 'allowed again: the session opens');
   await krtu.shutdown();
 });
+
+for (const scenario of ['module', 'build'] as const) {
+  test(`${scenario === 'module' ? 'the module' : 'the build'} switched off while an open is on its way: the late answer ends the server session and nothing beats (control: left on, the session opens and beats)`, async () => {
+    for (const off of [true, false]) {
+      const server = new FakeServer();
+      guestRoutes(server);
+      let modules: Record<string, boolean> = { sessions: true };
+      let switches: unknown[] = [];
+      let version = 1;
+      server.on('GET', '/v1/apps/buried/config', () => ({
+        json: { appId: 'app_x', environment: 'TEST', platform: 'WEB', version: `${version}.0`, config: { modules }, switches, serverTime: new Date().toISOString() },
+        headers: { etag: `"v${version}"` },
+      }));
+      server.on('GET', '/v1/me/telemetry-opt-out', () => ({ json: { optedOut: false, updatedAt: null } }));
+      let release: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      server.on('POST', '/v1/sessions', async () => {
+        await gate;
+        return { status: 201, json: { session: { id: `ses_${'l'.repeat(20)}`, startedAt: new Date().toISOString() }, heartbeatSeconds: 0.05, serverTime: new Date().toISOString() } };
+      });
+      const krtu = await Krtuworks.initialize(options(server, { sessions: true }));
+      await krtu.signInAsGuest({ birthDate: '2000-01-01', acceptedTerms: 'TERMS:v1 PRIVACY:v1' });
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(server.count('POST', '/v1/sessions'), 1, 'the open is on its way');
+
+      if (off) {
+        if (scenario === 'module') modules = { sessions: false };
+        else switches = [{ build: '*', mode: 'ALL' }];
+        version += 1;
+        await krtu.refreshConfig();
+      }
+      release();
+      await new Promise((r) => setTimeout(r, 250));
+      const ends = server.calls.filter((c) => c.path.endsWith('/end'));
+      const beats = server.calls.filter((c) => c.path.endsWith('/heartbeat'));
+      const keeper = (krtu as unknown as { sessions: { session: unknown } }).sessions;
+      if (off) {
+        assert.equal(ends.length, 1, 'the late session is ended on the server');
+        assert.ok(ends[0]!.path.includes(`ses_${'l'.repeat(20)}`), 'the end names the late session');
+        assert.equal(beats.length, 0, 'no heartbeat');
+        assert.equal(keeper.session, null, 'no active session');
+        assert.equal(server.count('POST', '/v1/sessions'), 1, 'no open is tried again');
+      } else {
+        assert.equal(ends.length, 0, 'control: left on, nothing is ended');
+        assert.ok(beats.length >= 1, 'control: left on, the session beats');
+        assert.notEqual(keeper.session, null, 'control: left on, the session is open');
+      }
+      await krtu.shutdown();
+    }
+  });
+}

@@ -106,7 +106,7 @@ export class SessionKeeper {
       const session = await this.open();
       if (session) this.retryMs = 0;
       // No session and no error: the answer was nobody's. A close in between ended the request; the start after it owns the retry.
-      else if (this.wanted && this.subject() && this.generation === generation) this.scheduleRetry(null);
+      else if (this.wanted && this.allowed() && this.subject() && this.generation === generation) this.scheduleRetry(null);
       return session;
     } catch (err) {
       this.scheduleRetry(isKrtuworksError(err) ? err : null);
@@ -165,8 +165,8 @@ export class SessionKeeper {
       owner,
     });
     const session = answer.json?.session as { id: string; startedAt: string } | undefined;
-    if (session && this.generation !== generation) {
-      // Closed while the open was on its way (the SDK shut down, the player left): the server's session ends now.
+    if (session && (this.generation !== generation || (this.wanted && !this.allowed()))) {
+      // Closed or switched off while the open was on its way (the SDK shut down, the player left, the module went off): the server's session ends now.
       void this.api.player(`/v1/sessions/${session.id}/end`, { method: 'POST', json: { activeSeconds: 0 }, keepalive: true, owner }).catch(() => undefined);
       return null;
     }
